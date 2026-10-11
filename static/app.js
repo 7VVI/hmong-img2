@@ -104,6 +104,7 @@ function initSender() {
     token: localStorage.getItem('imgport.token') || '',
     tiles: [],         // {wrap, ring, check} 每个文件的缩略图环引用
     thumbUrls: [],
+    thumbGen: 0,       // 缩略图队列版本号，列表变化即递增
     gen: 0,            // 传输代数，接收方重连时自增以中止旧循环
     transfer: { started: false, mode: null, finished: false, sent: 0, total: 0, fileSent: [] },
     lastUi: 0,
@@ -206,19 +207,17 @@ function renderSenderFiles() {
   S.tiles = [];
   S.thumbUrls.forEach((u) => URL.revokeObjectURL(u));
   S.thumbUrls = [];
+  S.thumbGen = (S.thumbGen || 0) + 1;
+  const gen = S.thumbGen;
+  // 先用占位图标立即渲染完整列表，缩略图由后台串行队列生成，
+  // 避免一次性全尺寸解码大量原图卡住界面
   S.files.forEach((f, i) => {
     const kind = fileKind(f.name, f.type);
-    const url = URL.createObjectURL(f);
-    S.thumbUrls.push(url);
-    const inner = kind === '图片'
-      ? `<img src="${url}" alt="">`
-      : kind === '视频'
-        ? `<video src="${url}" muted preload="metadata"></video>`
-        : fileIcon(f.name, f.type);
+    const ph = kind === '图片' ? '🖼️' : kind === '视频' ? '🎬' : '📄';
     const li = h(`<li class="fitem">
       <div class="thumbwrap" style="--p:0">
         <div class="ring"></div>
-        <div class="thumb-inner${kind === '文件' ? '' : ' zoomable'}">${inner}</div>
+        <div class="thumb-inner${kind === '文件' ? '' : ' zoomable'}">${ph}</div>
         <span class="ftag">${kind}</span>
         <button class="remove-btn" title="移除">✕</button>
         <span class="check" hidden>✓</span>
@@ -227,13 +226,6 @@ function renderSenderFiles() {
       <div class="fsize">${fmtBytes(f.size)}</div>
     </li>`);
     li.querySelector('.fname').textContent = f.name;
-    // HEIC 等 Web 端无法解码的原图，缩略图加载失败时回退为图标
-    const media = li.querySelector('.thumb-inner img, .thumb-inner video');
-    if (media) {
-      media.addEventListener('error', () => {
-        li.querySelector('.thumb-inner').innerHTML = kind === '视频' ? '🎬' : '🖼️';
-      });
-    }
     if (kind !== '文件') {
       li.querySelector('.thumb-inner').addEventListener('click', () => openPreview(f, f.name, f.size));
     }
@@ -245,6 +237,7 @@ function renderSenderFiles() {
       wrap: li.querySelector('.thumbwrap'),
       ring: li.querySelector('.ring'),
       check: li.querySelector('.check'),
+      inner: li.querySelector('.thumb-inner'),
     });
     ul.appendChild(li);
   });
@@ -255,6 +248,55 @@ function renderSenderFiles() {
   // 显隐与可用状态都从这里统一恢复，避免上一轮 beginSend 遗留的 disabled 卡住按钮
   $('#btnStart').disabled = !has;
   $('#totalHint').innerHTML = `已选择 <b>${S.files.length}</b> 个文件 · <b>${fmtBytes(total)}</b>`;
+  runThumbQueue(gen);
+}
+
+// 串行缩略图队列：一次只解码一张，降采样到 192px，避免主界面被解码压死
+async function runThumbQueue(gen) {
+  for (let i = 0; i < S.files.length; i++) {
+    if (gen !== S.thumbGen) return; // 列表已变化，丢弃本轮
+    const f = S.files[i];
+    const kind = fileKind(f.name, f.type);
+    const tile = S.tiles[i];
+    if (!tile) continue;
+    if (kind === '视频') {
+      // 视频由 <video> 异步取首帧，不阻塞
+      const url = URL.createObjectURL(f);
+      S.thumbUrls.push(url);
+      tile.inner.innerHTML = `<video src="${url}" muted preload="metadata"></video>`;
+      const v = tile.inner.querySelector('video');
+      v.addEventListener('error', () => { if (gen === S.thumbGen) tile.inner.innerHTML = '🎬'; });
+      continue;
+    }
+    if (kind !== '图片') continue;
+    const url = await makeThumb(f);
+    if (gen !== S.thumbGen) { if (url) URL.revokeObjectURL(url); return; }
+    if (url && S.tiles[i]) {
+      S.tiles[i].inner.innerHTML = `<img src="${url}" alt="">`;
+      S.thumbUrls.push(url);
+    }
+  }
+}
+
+async function makeThumb(f) {
+  try {
+    let bmp;
+    try {
+      bmp = await createImageBitmap(f, { resizeWidth: 192, resizeHeight: 192 });
+    } catch { /* 不支持缩放参数时全尺寸解码再由画布缩小 */
+      bmp = await createImageBitmap(f);
+    }
+    const scale = Math.min(192 / bmp.width, 192 / bmp.height, 1);
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(bmp.width * scale));
+    c.height = Math.max(1, Math.round(bmp.height * scale));
+    c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+    if (bmp.close) bmp.close();
+    const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.8));
+    return blob ? URL.createObjectURL(blob) : null;
+  } catch {
+    return null; // HEIC 等桌面端无法解码 → 保持占位图标
+  }
 }
 
 /* ---------- 原图预览（灯箱） ---------- */
@@ -373,8 +415,15 @@ async function submitKey() {
 
 async function beginSend() {
   if (!S.files.length) return;
-  // 进入传输阶段：先做方向/镜像归一化，再锁定文件列表
-  await normalizeOrientations();
+  // 进入传输阶段：先做方向/镜像归一化（大批照片耗时较长，按钮上显示进度），
+  // 再锁定文件列表
+  const btn = $('#btnStart');
+  btn.disabled = true;
+  btn.textContent = '正在准备文件…';
+  await normalizeOrientations((done, total) => {
+    btn.textContent = `正在处理图片 ${done}/${total}…`;
+  });
+  btn.textContent = '生成二维码，开始发送';
   renderSenderFiles();
   $('#pickCard').classList.add('picked');
   $('#dz').hidden = true;
@@ -1260,9 +1309,11 @@ async function bakeImage(f) {
   }
 }
 
-async function normalizeOrientations() {
+async function normalizeOrientations(onProgress) {
+  const total = S.files.length;
   for (let i = 0; i < S.files.length; i++) {
     const f = S.files[i];
+    if (onProgress) onProgress(i + 1, total);
     try {
       const isPng = f.type === 'image/png' || /\.png$/i.test(f.name);
       const isHeic = /\.(heic|heif)$/i.test(f.name) || f.type === 'image/heic' || f.type === 'image/heif';
