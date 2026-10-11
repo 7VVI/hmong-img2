@@ -1,7 +1,13 @@
 //! 实时传输层：WebSocket 升级、连接登记、信令转发与数据中转。
 //!
-//! 数据帧（DataChannel 与 WebSocket 二进制帧通用）：`[u16 文件序号(小端)] + [文件内容分片]`；
-//! 控制消息为 JSON 文本帧，字段 `t` 表示类型。帧的具体含义由前端约定，本层只负责转发。
+//! 连接分两类：
+//! - 控制连接（无 slot 参数）：收发双方的信令与控制消息（JSON 文本帧），
+//!   服务端在对端控制连接之间转发；
+//! - 数据连接（带 slot 参数）：二进制数据帧按槽位号在对端同号槽位之间
+//!   1:1 转发，收发双方各开 SLOTS 条即可并行传输。
+//!
+//! 数据帧格式：`[u16 文件序号(小端)][u16 分段号(小端)][文件内容分片]`，
+//! 帧的切分与重组语义由前端约定，本层只负责按槽位转发。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,8 +32,8 @@ use crate::state::AppState;
 
 /// 需要在收发双方之间转发的控制消息类型。
 const RELAYED_TYPES: &[&str] = &[
-    "sdp", "ice", "meta", "relay-mode", "file-start", "file-end", "complete", "cancel", "received",
-    "error",
+    "sdp", "ice", "meta", "relay-mode", "ready", "file-start", "file-end", "complete", "cancel",
+    "received", "error",
 ];
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -39,6 +45,7 @@ struct WsParams {
     r: String,
     role: String,
     token: Option<String>,
+    slot: Option<u16>,
 }
 
 async fn ws_handler(
@@ -57,37 +64,47 @@ async fn ws_handler(
             return (StatusCode::UNAUTHORIZED, "需要有效的访问密钥").into_response();
         }
     }
-    ws.on_upgrade(move |socket| handle_socket(socket, params, state))
+    ws.on_upgrade(move |socket| async move {
+        if params.slot.is_some() {
+            handle_data_socket(socket, params, state).await;
+        } else {
+            handle_ctl_socket(socket, params, state).await;
+        }
+    })
 }
 
-async fn handle_socket(socket: WebSocket, params: WsParams, state: Arc<AppState>) {
+fn parse_ctl(text: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(text).ok()
+}
+
+/// 控制连接：信令转发 + 控制消息转发 + 文件清单缓存。
+async fn handle_ctl_socket(socket: WebSocket, params: WsParams, state: Arc<AppState>) {
     let is_sender = params.role == "sender";
     let room_id = params.r;
 
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
 
-    // 登记到房间：发送方不存在则自动补建；接收方顶替旧连接。
-    if is_sender {
-        if let Some(old) = state.rooms.register_sender(&room_id, tx.clone()) {
-            let _ = old.send(Message::Close(None));
-        }
-    } else {
-        let Some(join) = state.rooms.register_receiver(&room_id, tx.clone()) else {
-            tracing::info!("接收方加入不存在的房间 {room_id}，拒绝");
+    match state.rooms.register_ctl(&room_id, is_sender, tx.clone()) {
+        None => {
             let _ = sink.send(Message::Close(None)).await;
             return;
-        };
-        if let Some(old) = join.replaced_tx {
-            let _ = old.send(Message::Close(None));
         }
-        if let Some(meta) = join.meta {
-            let _ = tx.send(Message::Text(meta.to_string().into()));
+        Some((replaced, meta)) => {
+            if let Some(old) = replaced {
+                let _ = old.send(Message::Close(None));
+            }
+            if !is_sender {
+                if let Some(meta) = meta {
+                    let _ = tx.send(Message::Text(meta.to_string().into()));
+                }
+                if let Some(sender) = state.rooms.peer_ctl_tx(&room_id, false) {
+                    let _ =
+                        sender.send(Message::Text(json!({"t":"peer-joined"}).to_string().into()));
+                }
+                tracing::info!("接收方加入房间 {room_id}");
+            }
         }
-        if let Some(sender) = state.rooms.peer_tx(&room_id, false) {
-            let _ = sender.send(Message::Text(json!({"t":"peer-joined"}).to_string().into()));
-        }
-        tracing::info!("接收方加入房间 {room_id}");
     }
 
     // 心跳，穿透反向代理的空闲超时。
@@ -110,11 +127,99 @@ async fn handle_socket(socket: WebSocket, params: WsParams, state: Arc<AppState>
             next = stream.next() => {
                 match next {
                     Some(Ok(Message::Text(text))) => {
-                        on_text(&state, &room_id, is_sender, text.as_str());
+                        if let Some(v) = parse_ctl(text.as_str()) {
+                            on_ctl(&state, &room_id, is_sender, &v, text.as_str());
+                        }
                     }
+                    // 控制连接不再承载数据帧；仅用于续活
+                    Some(Ok(Message::Binary(_))) => state.rooms.touch(&room_id),
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => state.rooms.touch(&room_id),
+                    Some(Err(_)) => break,
+                }
+            }
+        }
+    }
+
+    match state.rooms.unregister_ctl(&room_id, is_sender, &tx) {
+        Unregister::SenderRemoved {
+            receiver_ctl,
+            close_list,
+        } => {
+            for tx in close_list {
+                let _ = tx.send(Message::Close(None));
+            }
+            if let Some(receiver) = receiver_ctl {
+                let _ =
+                    receiver.send(Message::Text(json!({"t":"room-closed"}).to_string().into()));
+                let _ = receiver.send(Message::Close(None));
+            }
+            tracing::info!("发送方离开，房间 {room_id} 关闭");
+        }
+        Unregister::ReceiverRemoved {
+            sender_ctl,
+            close_list,
+        } => {
+            for tx in close_list {
+                let _ = tx.send(Message::Close(None));
+            }
+            if let Some(sender) = sender_ctl {
+                let _ = sender.send(Message::Text(json!({"t":"peer-left"}).to_string().into()));
+            }
+            tracing::info!("接收方离开房间 {room_id}");
+        }
+        Unregister::NotOwner => {}
+    }
+}
+
+fn on_ctl(state: &AppState, room_id: &str, from_sender: bool, v: &Value, text: &str) {
+    let t = v.get("t").and_then(Value::as_str).unwrap_or("");
+    if !RELAYED_TYPES.contains(&t) {
+        return;
+    }
+    if t == "meta" {
+        state.rooms.store_meta(room_id, v.clone());
+    }
+    if let Some(peer) = state.rooms.peer_ctl_tx(room_id, from_sender) {
+        let _ = peer.send(Message::Text(text.to_owned().into()));
+    }
+}
+
+/// 数据连接：二进制帧按槽位号在对端同号槽位之间 1:1 转发。
+async fn handle_data_socket(socket: WebSocket, params: WsParams, state: Arc<AppState>) {
+    let is_sender = params.role == "sender";
+    let room_id = params.r;
+    let slot = params.slot.unwrap_or(0);
+
+    let (mut sink, mut stream) = socket.split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+
+    if !state.rooms.register_data(&room_id, is_sender, slot, tx.clone()) {
+        tracing::debug!("数据槽位 {slot} 加入不存在的房间 {room_id}，拒绝");
+        let _ = sink.send(Message::Close(None)).await;
+        return;
+    }
+
+    let mut ping = tokio::time::interval(Duration::from_secs(25));
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = ping.tick() => {
+                if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
+            Some(msg) = rx.recv() => {
+                let closing = matches!(msg, Message::Close(_));
+                if sink.send(msg).await.is_err() || closing {
+                    break;
+                }
+            }
+            next = stream.next() => {
+                match next {
                     Some(Ok(Message::Binary(data))) => {
-                        // 数据帧原样转发给对端（中转模式）。
-                        if let Some(peer) = state.rooms.peer_tx(&room_id, is_sender) {
+                        if let Some(peer) = state.rooms.peer_data_tx(&room_id, is_sender, slot) {
                             let _ = peer.send(Message::Binary(data));
                         }
                     }
@@ -126,37 +231,5 @@ async fn handle_socket(socket: WebSocket, params: WsParams, state: Arc<AppState>
         }
     }
 
-    // 注销：只清理仍然属于自己的槽位，避免误伤顶替上来的新连接。
-    match state.rooms.unregister(&room_id, is_sender, &tx) {
-        Unregister::SenderRemoved { receiver } => {
-            if let Some(receiver) = receiver {
-                let _ = receiver.send(Message::Text(json!({"t":"room-closed"}).to_string().into()));
-                let _ = receiver.send(Message::Close(None));
-            }
-            tracing::info!("发送方离开，房间 {room_id} 关闭");
-        }
-        Unregister::ReceiverRemoved { sender } => {
-            if let Some(sender) = sender {
-                let _ = sender.send(Message::Text(json!({"t":"peer-left"}).to_string().into()));
-            }
-            tracing::info!("接收方离开房间 {room_id}");
-        }
-        Unregister::NotOwner => {}
-    }
-}
-
-fn on_text(state: &AppState, room_id: &str, from_sender: bool, text: &str) {
-    let Ok(v) = serde_json::from_str::<Value>(text) else {
-        return;
-    };
-    let t = v.get("t").and_then(Value::as_str).unwrap_or("");
-    if !RELAYED_TYPES.contains(&t) {
-        return;
-    }
-    if t == "meta" {
-        state.rooms.store_meta(room_id, v.clone());
-    }
-    if let Some(peer) = state.rooms.peer_tx(room_id, from_sender) {
-        let _ = peer.send(Message::Text(text.to_owned().into()));
-    }
+    state.rooms.unregister_data(&room_id, is_sender, slot, &tx);
 }

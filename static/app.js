@@ -1,13 +1,16 @@
 /* imgport 前端
  *
  * 发送方（无 ?r 参数）：选文件 → 生成二维码 → 等接收方 → 协商 WebRTC
- *   - DataChannel 打开        → P2P 直连传输
- *   - 收到 relay-mode         → 关闭 PeerConnection，走服务器 WebSocket 中转
- * 接收方（?r=房间号）：连接即等待 → 自动接收 → 自动保存 + 相册预览
+ *   - 全部 DataChannel 打开   → P2P 直连，文件切 SLOTS 个分段并行传输
+ *   - 收到 relay-mode         → 关闭 PeerConnection，打开 SLOTS 条数据 WebSocket
+ *                               经服务器并行中转
+ * 接收方（?r=房间号）：连接即等待 → 自动接收 → 自动保存 + 缩略图网格
  *
- * 数据帧格式（DataChannel 与 WebSocket 二进制帧通用）：
- *   [u16 文件序号(小端)] [文件内容分片]
- * 控制消息为 JSON 文本帧，字段 t 表示类型。
+ * 数据帧格式（DataChannel 与数据 WebSocket 通用）：
+ *   [u16 文件序号(小端)][u16 分段号(小端)][文件内容分片]
+ * 每个文件切 SLOTS 个连续分段，分段 p 走槽位 p（段内有序），接收端按
+ * 「已收字节 = 文件大小」判定完成并按分段顺序拼接。
+ * 控制消息为 JSON 文本帧，统一走控制 WebSocket。
  */
 'use strict';
 
@@ -37,6 +40,12 @@ function fileIcon(name, mime) {
   return '📄';
 }
 
+function fileKind(name, mime) {
+  if (/^image\//.test(mime) || /\.(png|jpe?g|gif|webp|bmp|avif|heic|heif)$/i.test(name)) return '图片';
+  if (/^video\//.test(mime) || /\.(mp4|mov|mkv|webm|avi|m4v)$/i.test(name)) return '视频';
+  return '文件';
+}
+
 const ROOM = new URLSearchParams(location.search).get('r');
 const FORCE_RELAY = new URLSearchParams(location.search).get('relay') === '1';
 
@@ -44,14 +53,17 @@ const ICE_SERVERS = [{
   urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'],
 }];
 
+const SLOTS = 3;                 // 并行数据通道数（DataChannel 或数据 WebSocket）
 const DC_CHUNK = 16 * 1024;      // DataChannel 单帧上限（跨浏览器安全值）
 const RELAY_CHUNK = 64 * 1024;   // WebSocket 中转分片
 const DC_HIGH_WATER = 1024 * 1024;        // DataChannel 背压阈值
-const RELAY_HIGH_WATER = 4 * 1024 * 1024; // WebSocket 背压阈值
+const RELAY_HIGH_WATER = 2 * 1024 * 1024; // WebSocket 背压阈值
 
-function wsUrl(room, role) {
+function wsUrl(room, role, slot) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  return `${proto}://${location.host}/ws?r=${encodeURIComponent(room)}&role=${role}`;
+  let url = `${proto}://${location.host}/ws?r=${encodeURIComponent(room)}&role=${role}`;
+  if (slot != null) url += '&slot=' + slot;
+  return url;
 }
 
 /* ================= 页面骨架 ================= */
@@ -80,19 +92,20 @@ function initSender() {
   S = {
     files: [],
     room: null,
-    ws: null,
+    ws: null,          // 控制 WebSocket（信令与控制消息）
+    dataWs: [],        // 中转模式的数据 WebSocket（按槽位）
     pc: null,
-    dc: null,
-    tiles: [],     // {wrap, ring, check} 每个文件的缩略图环引用
+    dc: [],            // P2P 模式的 DataChannel（按槽位）
+    dcOpen: 0,
+    dataWsOpen: 0,
+    receiverReady: false,
+    onReceiverReady: null,
+    closing: false,    // 主动关闭 WS（销毁房间）时不触发报错提示
+    token: localStorage.getItem('imgport.token') || '',
+    tiles: [],         // {wrap, ring, check} 每个文件的缩略图环引用
     thumbUrls: [],
-    gen: 0,        // 传输代数，接收方重连时自增以中止旧循环
-    closing: false, // 主动关闭 WS（销毁房间）时不触发报错提示
-    token: localStorage.getItem('imgport.token') || '', // 访问密钥令牌，创建房间与建连时携带
-    liveSet: new Set(), // 命中 Live Photo 配对的文件下标
-    liveVersion: 0,     // 配对扫描版本号，文件变化即递增
-    liveDetect: null,   // 最近一次扫描的 Promise
-    transfer: { started: false, mode: null, finished: false, sent: 0, total: 0, doneCount: 0, cur: -1 },
-    qrText: '',
+    gen: 0,            // 传输代数，接收方重连时自增以中止旧循环
+    transfer: { started: false, mode: null, finished: false, sent: 0, total: 0, fileSent: [] },
     lastUi: 0,
     lastBytes: 0,
     lastTime: 0,
@@ -109,8 +122,6 @@ function initSender() {
         <span class="dz-title">点击选择文件</span>
         <span class="dz-hint">图片与视频，可多选</span>
       </div>
-      <!-- 不设 accept：iOS 弹出系统面板（照片图库/拍摄/选取文件），「选取文件」可进入文件 App
-           选择 Live Photo 原始对，且照片图库路径返回原始 HEIC 不转码 -->
       <input type="file" id="picker" multiple hidden>
       <div class="sel-bar" id="selBar" hidden>
         <span class="total-hint" id="totalHint"></span>
@@ -141,7 +152,6 @@ function initSender() {
       <div class="status-line"><span class="dot" id="stDot"></span><span id="stText">等待接收方扫码…</span><span class="mode-badge" id="modeBadge" hidden></span></div>
       <div class="progress" id="prog" hidden><div class="fill" id="progFill"></div></div>
       <div class="progress-meta" id="progMeta" hidden><span id="progBytes"></span><span id="progSpeed"></span></div>
-      <ul class="fgrid" id="txList"></ul>
       <div class="banner err" id="errBanner" hidden></div>
     </section>
   `;
@@ -175,186 +185,19 @@ function initSender() {
   });
 }
 
-function fileKind(name, mime) {
-  if (/^image\//.test(mime) || /\.(png|jpe?g|gif|webp|bmp|avif|heic)$/i.test(name)) return '图片';
-  if (/^video\//.test(mime) || /\.(mp4|mov|mkv|webm|avi|m4v)$/i.test(name)) return '视频';
-  return '文件';
-}
-
 function addSenderFiles(list) {
   for (const f of list) {
     if (S.files.some((x) => x.name === f.name && x.size === f.size && x.lastModified === f.lastModified)) continue;
     S.files.push(f);
   }
   renderSenderFiles();
-  detectLivePairs();
 }
 
 function clearSenderFiles() {
   S.files = [];
   S.thumbUrls.forEach((u) => URL.revokeObjectURL(u));
   S.thumbUrls = [];
-  S.liveVersion = (S.liveVersion || 0) + 1; // 使进行中的扫描失效
-  S.liveSet = new Set();
-  S.liveDetect = null;
   renderSenderFiles();
-}
-
-/* ---------- Live Photo 配对识别 ----------
- * Live Photo 由「静态图（HEIC/JPEG）+ MOV 视频」组成，两者内嵌同一个
- * Apple ContentIdentifier（UUID 字符串），MOV 侧还带
- * com.apple.quicktime.content.identifier 标记。对文件字节做流式扫描，
- * 同一 UUID 同时出现在一张静态图与一个带标记的 MOV 中即判定为 Live 对。 */
-
-const LIVE_MARKER = 'com.apple.quicktime.content.identifier';
-const UUID_DASHED_RE = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g;
-const UUID_PLAIN_RE = /[^0-9a-fA-F]([0-9a-fA-F]{32})[^0-9a-fA-F]/g; // 无连字符形式
-const SCAN_CHUNK = 4 * 1024 * 1024;
-const SCAN_OVERLAP = 128; // 覆盖跨块边界的 UUID 字符串
-
-function extractUuids(text, set) {
-  for (const m of text.matchAll(UUID_DASHED_RE)) {
-    set.add(m[0].replace(/-/g, '').toUpperCase());
-  }
-  // 无连字符扫描前先把带连字符的匹配位换成空格，避免片段误命中
-  const stripped = text.replace(UUID_DASHED_RE, (m) => ' '.repeat(m.length));
-  for (const m of (' ' + stripped + ' ').matchAll(UUID_PLAIN_RE)) {
-    set.add(m[1].toUpperCase());
-  }
-}
-
-async function scanUuids(file) {
-  const uuids = new Set();
-  let marker = false;
-  let offset = 0;
-  while (offset < file.size) {
-    const end = Math.min(offset + SCAN_CHUNK + SCAN_OVERLAP, file.size);
-    const text = new TextDecoder('latin1').decode(await file.slice(offset, end).arrayBuffer());
-    if (!marker && text.includes(LIVE_MARKER)) marker = true;
-    extractUuids(text, uuids);
-    offset += SCAN_CHUNK;
-  }
-  return { uuids, marker };
-}
-
-function detectLivePairs() {
-  // 每次文件列表变化都重新扫描；版本号保证旧扫描结果作废
-  const v = (S.liveVersion || 0) + 1;
-  S.liveVersion = v;
-  S.liveDetect = (async () => {
-    await sleep(80); // 合并连续的文件添加
-    if (v !== S.liveVersion || !S.files.length) {
-      S.liveSet = new Set();
-      renderSenderFiles();
-      return;
-    }
-    const isStill = (f) => /\.(heic|heif|jpe?g|tiff?)$/i.test(f.name) || /^image\//.test(f.type);
-    const isMov = (f) => /\.(mov|mp4|m4v)$/i.test(f.name) || /^video\//.test(f.type);
-    const scans = S.files.map(async (f, i) => {
-      if (!isStill(f) && !isMov(f)) return null;
-      const r = await scanUuids(f);
-      return { i, isStill: isStill(f), isMov: isMov(f), ...r };
-    });
-    const results = (await Promise.all(scans)).filter(Boolean);
-    if (v !== S.liveVersion) return; // 扫描期间文件又变了，结果作废
-    const movByUuid = new Map();
-    for (const r of results) {
-      if (!r.isMov || !r.marker) continue;
-      for (const u of r.uuids) if (!movByUuid.has(u)) movByUuid.set(u, r.i);
-    }
-    const liveSet = new Set();
-    for (const r of results) {
-      if (!r.isStill) continue;
-      for (const u of r.uuids) {
-        const movIdx = movByUuid.get(u);
-        if (movIdx !== undefined) {
-          liveSet.add(r.i);
-          liveSet.add(movIdx);
-          break;
-        }
-      }
-    }
-    if (v !== S.liveVersion) return;
-    S.liveSet = liveSet;
-    renderSenderFiles();
-  })();
-  return S.liveDetect;
-}
-
-/* ---------- 方向/镜像归一化 ----------
- * iPhone 的实况/自拍方向与前置镜像效果存放在 HEIC/EXIF 元数据里，不同查看器解释
- * 不一致会导致接收方看到被"反转回去"的图片。发送前用浏览器解码（与拍照预览同一
- * 解码器，所见即所得）把像素烘焙成 JPEG，保证任何设备上显示完全一致。
- * PNG、视频、Live 对保持字节原样；无方向标记的 JPEG 也不重编码。 */
-
-function jpegOrientation(buf) {
-  // 兼容 ArrayBuffer 输入（File.slice().arrayBuffer() 的返回值）
-  if (!(buf instanceof Uint8Array)) buf = new Uint8Array(buf);
-  if (buf.length < 4 || buf[0] !== 0xFF || buf[1] !== 0xD8) return 1;
-  let o = 2;
-  while (o + 4 < buf.length) {
-    if (buf[o] !== 0xFF) { o++; continue; }
-    const marker = buf[o + 1];
-    if (marker === 0xFF) { o++; continue; }
-    if (marker === 0xD8 || (marker >= 0xD0 && marker <= 0xD7) || marker === 0x01) { o += 2; continue; }
-    if (marker === 0xD9 || marker === 0xDA) break; // EOI / SOS：EXIF 只在前面
-    const len = (buf[o + 2] << 8) | buf[o + 3];
-    if (marker === 0xE1 && len > 10 &&
-        buf[o + 4] === 0x45 && buf[o + 5] === 0x78 && buf[o + 6] === 0x69 &&
-        buf[o + 7] === 0x66 && buf[o + 8] === 0x00 && buf[o + 9] === 0x00) {
-      const tiff = o + 10;
-      const le = buf[tiff] === 0x49 && buf[tiff + 1] === 0x49;
-      const rd16 = (p) => le ? buf[p] | (buf[p + 1] << 8) : (buf[p] << 8) | buf[p + 1];
-      const rd32 = (p) => le
-        ? (buf[p] | (buf[p + 1] << 8) | (buf[p + 2] << 16) | (buf[p + 3] << 24))
-        : ((buf[p] << 24) | (buf[p + 1] << 16) | (buf[p + 2] << 8) | buf[p + 3]);
-      const ifd = tiff + rd32(tiff + 4);
-      const count = rd16(ifd);
-      for (let k = 0; k < count; k++) {
-        const e = ifd + 2 + k * 12;
-        if (rd16(e) === 0x0112) return rd16(e + 8); // Orientation
-      }
-      return 1;
-    }
-    o += 2 + len;
-  }
-  return 1;
-}
-
-async function bakeImage(f) {
-  const url = URL.createObjectURL(f);
-  try {
-    const img = new Image();
-    await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = url; });
-    const area = img.naturalWidth * img.naturalHeight;
-    const scale = Math.min(1, Math.sqrt((16 * 1024 * 1024) / area)); // 兼容 iOS 画布面积上限
-    const c = document.createElement('canvas');
-    c.width = Math.max(1, Math.round(img.naturalWidth * scale));
-    c.height = Math.max(1, Math.round(img.naturalHeight * scale));
-    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
-    const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.95));
-    if (!blob) return null;
-    const name = f.name.replace(/\.(heic|heif|jpe?g|tiff?)$/i, '') + '.jpg';
-    return new File([blob], name, { type: 'image/jpeg', lastModified: f.lastModified });
-  } finally {
-    URL.revokeObjectURL(url);
-  }
-}
-
-async function normalizeOrientations() {
-  for (let i = 0; i < S.files.length; i++) {
-    const f = S.files[i];
-    try {
-      if (S.liveSet.has(i)) continue; // Live 对保持原始字节以保留配对元数据
-      const isPng = f.type === 'image/png' || /\.png$/i.test(f.name);
-      const isHeic = /\.(heic|heif)$/i.test(f.name) || f.type === 'image/heic' || f.type === 'image/heif';
-      const isJpg = /\.(jpe?g)$/i.test(f.name) || f.type === 'image/jpeg';
-      if (isPng || (!isHeic && !isJpg)) continue;
-      if (isJpg && jpegOrientation(await f.slice(0, 262144).arrayBuffer()) === 1) continue;
-      const replaced = await bakeImage(f);
-      if (replaced) S.files[i] = replaced;
-    } catch { /* 解码失败（如桌面端无 HEIC 解码器）则保持原文件 */ }
-  }
 }
 
 function renderSenderFiles() {
@@ -365,7 +208,6 @@ function renderSenderFiles() {
   S.thumbUrls = [];
   S.files.forEach((f, i) => {
     const kind = fileKind(f.name, f.type);
-    const tag = S.liveSet.has(i) ? 'Live' : kind;
     const url = URL.createObjectURL(f);
     S.thumbUrls.push(url);
     const inner = kind === '图片'
@@ -377,7 +219,7 @@ function renderSenderFiles() {
       <div class="thumbwrap" style="--p:0">
         <div class="ring"></div>
         <div class="thumb-inner${kind === '文件' ? '' : ' zoomable'}">${inner}</div>
-        <span class="ftag">${tag}</span>
+        <span class="ftag">${kind}</span>
         <button class="remove-btn" title="移除">✕</button>
         <span class="check" hidden>✓</span>
       </div>
@@ -398,7 +240,6 @@ function renderSenderFiles() {
     li.querySelector('.remove-btn').addEventListener('click', () => {
       S.files.splice(i, 1);
       renderSenderFiles();
-      detectLivePairs();
     });
     S.tiles.push({
       wrap: li.querySelector('.thumbwrap'),
@@ -454,11 +295,86 @@ function closePreview() {
   document.body.style.overflow = '';
 }
 
+/* ---------- 密钥门禁 ---------- */
+
+async function bootSender() {
+  let required = true;
+  let days = 30;
+  try {
+    const r = await fetch('/api/auth/info');
+    const j = await r.json();
+    required = !!j.required;
+    days = j.days || 30;
+  } catch { /* 服务不可达时直接进入，后续操作会给出明确错误 */ }
+
+  if (required) {
+    const saved = localStorage.getItem('imgport.token');
+    if (saved) {
+      try {
+        const r = await fetch('/api/auth/check?token=' + encodeURIComponent(saved));
+        if (r.ok) { initSender(); return; }
+      } catch { /* 网络异常则按未登录处理 */ }
+      localStorage.removeItem('imgport.token');
+    }
+    renderKeyGate(days);
+    return;
+  }
+  initSender();
+}
+
+function renderKeyGate(days) {
+  $('#main').innerHTML = `
+    <section class="card center key-card">
+      <div class="key-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15" r="1.4" fill="#fff" stroke="none"/>
+        </svg>
+      </div>
+      <h2>请输入访问密钥</h2>
+      <p class="muted" style="margin:0 0 18px">本服务仅供授权使用，验证后 ${days} 天内免输入</p>
+      <input type="password" id="keyInput" class="key-input" placeholder="访问密钥" autocomplete="off" autofocus>
+      <button class="btn block" id="btnKey">进入</button>
+      <div class="banner err" id="keyErr" hidden></div>
+    </section>
+  `;
+  $('#btnKey').addEventListener('click', submitKey);
+  $('#keyInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') submitKey(); });
+  $('#keyInput').focus();
+}
+
+async function submitKey() {
+  const key = $('#keyInput').value.trim();
+  if (!key) { $('#keyInput').focus(); return; }
+  const btn = $('#btnKey');
+  btn.disabled = true;
+  btn.textContent = '验证中…';
+  try {
+    const r = await fetch('/api/auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key }),
+    });
+    if (!r.ok) throw new Error('密钥错误，请重新输入');
+    const j = await r.json();
+    localStorage.setItem('imgport.token', j.token);
+    $('#main').innerHTML = '';
+    initSender();
+  } catch (e) {
+    const err = $('#keyErr');
+    err.hidden = false;
+    err.textContent = e.message || '验证失败，请重试';
+    btn.disabled = false;
+    btn.textContent = '进入';
+    $('#keyInput').select();
+  }
+}
+
+/* ---------- 发送流程 ---------- */
+
 async function beginSend() {
   if (!S.files.length) return;
-  // 进入传输阶段：锁定文件列表，隐藏选择交互
-  await detectLivePairs();   // 先在原始字节上识别 Live 配对
-  await normalizeOrientations(); // 再烘焙方向/镜像，保证接收端显示一致
+  // 进入传输阶段：先做方向/镜像归一化，再锁定文件列表
+  await normalizeOrientations();
   renderSenderFiles();
   $('#pickCard').classList.add('picked');
   $('#dz').hidden = true;
@@ -473,8 +389,8 @@ async function beginSend() {
     if (!res.ok) throw new Error(res.status === 401 ? '密钥已失效，请刷新页面重新输入' : '创建房间失败，请重试');
     const { id } = await res.json();
     S.room = id;
-  } catch {
-    setSenderStatus('err', '创建房间失败，请重试');
+  } catch (e) {
+    setSenderStatus('err', e.message || '创建房间失败，请重试');
     $('#pickCard').classList.remove('picked');
     $('#dz').hidden = false;
     $('#btnClear').hidden = false;
@@ -490,27 +406,6 @@ async function beginSend() {
   $('#joinUrl').value = `${location.origin}/?r=${S.room}`;
   await refreshQr();
   openSenderWs();
-}
-
-/* ---------- 销毁当前房间，回到选择阶段重新开始 ---------- */
-
-// 「新建传输」/「再传一批」：销毁当前房间、回到选择阶段并清空已选文件
-function restartSend() {
-  try { sendCtl({ t: 'cancel' }); } catch { /* 对端可能已不在线 */ }
-  S.gen++;              // 终止进行中的发送循环
-  S.closing = true;     // 主动关闭，不走 onclose 的报错提示
-  teardownPc();
-  if (S.ws) { try { S.ws.close(); } catch { /* noop */ } S.ws = null; }
-  // 发送方 WebSocket 关闭后，服务器会自动销毁房间并通知接收方
-  senderResetRound();
-  clearSenderFiles();
-  $('#qrCard').hidden = true;
-  $('#statusCard').hidden = true;
-  $('#btnRestart').hidden = true;
-  $('#btnReset').hidden = true;
-  $('#pickCard').classList.remove('picked');
-  $('#dz').hidden = false;
-  $('#btnClear').hidden = false;
 }
 
 async function refreshQr() {
@@ -563,7 +458,7 @@ function openSenderWs() {
   S.ws = ws;
   ws.onopen = () => {
     S.closing = false;
-    sendWsCtl({ t: 'meta', files: S.files.map((f, i) => fileMeta(f, i)) });
+    sendWsCtl({ t: 'meta', files: S.files.map((f) => fileMeta(f)) });
     setSenderStatus('', '等待接收方扫码…');
   };
   ws.onmessage = (ev) => {
@@ -574,8 +469,8 @@ function openSenderWs() {
   };
 }
 
-function fileMeta(f, i) {
-  return { name: f.name, size: f.size, mime: f.type || '', live: i != null && S.liveSet.has(i) };
+function fileMeta(f) {
+  return { name: f.name, size: f.size, mime: f.type || '' };
 }
 
 function sendWsCtl(obj) {
@@ -599,17 +494,30 @@ function senderOnCtl(msg) {
         S.pc.addIceCandidate(msg.candidate).catch(() => {});
       }
       break;
+    case 'ready':
+      S.receiverReady = true;
+      break;
     case 'relay-mode': {
       if (S.transfer.started && S.transfer.mode === 'p2p') break; // P2P 已在传输，忽略
       S.transfer.mode = 'relay';
       teardownPc();
-      startPump('relay');
+      (async () => {
+        try {
+          await openSenderDataWs();
+          const t0 = Date.now();
+          while (!S.receiverReady && Date.now() - t0 < 8000) await sleep(50);
+          startPump('relay');
+        } catch {
+          setSenderStatus('err', '建立中转连接失败');
+          $('#btnReset').hidden = false;
+        }
+      })();
       break;
     }
     case 'received':
-      S.transfer.doneCount++;
+      S.transfer.doneCount = (S.transfer.doneCount || 0) + 1;
       if (S.tiles[msg.i]) {
-        S.tiles[msg.i].wrap.classList.remove('sent');
+        S.tiles[msg.i].wrap.classList.remove('sent', 'sending');
         S.tiles[msg.i].wrap.classList.add('ack');
         S.tiles[msg.i].check.hidden = false;
       }
@@ -625,7 +533,7 @@ function senderOnCtl(msg) {
 
 function senderResetRound() {
   S.gen++;
-  S.transfer = { started: false, mode: null, finished: false, sent: 0, total: 0, doneCount: 0, cur: -1 };
+  S.transfer = { started: false, mode: null, finished: false, sent: 0, total: 0, fileSent: [] };
   S.lastBytes = 0; S.lastTime = 0;
   S.tiles.forEach((t) => {
     t.wrap.className = 'thumbwrap';
@@ -643,8 +551,26 @@ function senderResetRound() {
 function senderWebRTC() {
   const pc = new RTCPeerConnection(ICE_SERVERS);
   S.pc = pc;
-  const dc = pc.createDataChannel('data', { ordered: true });
-  wireSenderDc(dc);
+  S.dc = [];
+  S.dcOpen = 0;
+  // SLOTS 条 DataChannel：文件切成 SLOTS 个分段，分段 p 走通道 p 并行传输
+  for (let p = 0; p < SLOTS; p++) {
+    const dc = pc.createDataChannel('data' + p, { ordered: true });
+    dc.binaryType = 'arraybuffer';
+    dc.bufferedAmountLowThreshold = DC_HIGH_WATER;
+    dc.onopen = () => {
+      S.dcOpen++;
+      if (S.dcOpen === SLOTS && !S.transfer.started && S.transfer.mode !== 'relay') startPump('p2p');
+    };
+    dc.onclose = () => {
+      if (S.transfer.mode === 'p2p' && !S.transfer.finished) {
+        setSenderStatus('err', 'P2P 连接中断，请让接收方重新扫码');
+        sendWsCtl({ t: 'cancel' });
+        $('#btnReset').hidden = false;
+      }
+    };
+    S.dc.push(dc);
+  }
   pc.onicecandidate = (e) => { if (e.candidate) sendWsCtl({ t: 'ice', candidate: e.candidate }); };
   pc.createOffer()
     .then(async (offer) => {
@@ -656,35 +582,86 @@ function senderWebRTC() {
       if (!S.transfer.started) {
         S.transfer.mode = 'relay';
         teardownPc();
-        startPump('relay');
+        (async () => {
+          await openSenderDataWs();
+          const t0 = Date.now();
+          while (!S.receiverReady && Date.now() - t0 < 8000) await sleep(50);
+          startPump('relay');
+        })();
       }
     });
-}
-
-function wireSenderDc(dc) {
-  dc.binaryType = 'arraybuffer';
-  dc.bufferedAmountLowThreshold = DC_HIGH_WATER;
-  dc.onopen = () => startPump('p2p');
-  dc.onclose = () => {
-    if (S.dc === dc && S.transfer.mode === 'p2p' && !S.transfer.finished) {
-      setSenderStatus('err', 'P2P 连接中断，请让接收方重新扫码');
-      sendWsCtl({ t: 'cancel' });
-      $('#btnReset').hidden = false;
-    }
-  };
-  S.dc = dc;
 }
 
 function teardownPc() {
   if (S.pc) { try { S.pc.close(); } catch { /* noop */ } }
   S.pc = null;
-  S.dc = null;
+  S.dc = [];
+  S.dcOpen = 0;
+}
+
+/* ---------- 中转模式的数据连接 ---------- */
+
+function openSenderDataWs() {
+  return new Promise((resolve) => {
+    let opened = 0;
+    S.dataWs = [];
+    for (let p = 0; p < SLOTS; p++) {
+      let url = wsUrl(S.room, 'sender', p);
+      if (S.token) url += '&token=' + encodeURIComponent(S.token);
+      const ws = new WebSocket(url);
+      ws.binaryType = 'arraybuffer';
+      ws.onopen = () => { if (++opened === SLOTS) resolve(); };
+      ws.onerror = () => {};
+      ws.onclose = () => {};
+      S.dataWs[p] = ws;
+    }
+    setTimeout(resolve, 8000); // 兜底：超时后由 sendSlot 的状态检查兜底报错
+  });
+}
+
+/* ---------- 销毁当前房间，回到选择阶段重新开始 ---------- */
+
+function restartSend() {
+  try { sendWsCtl({ t: 'cancel' }); } catch { /* 对端可能已不在线 */ }
+  S.gen++;              // 终止进行中的发送循环
+  S.closing = true;     // 主动关闭，不走 onclose 的报错提示
+  teardownPc();
+  S.dataWs.forEach((w) => { try { w.close(); } catch { /* noop */ } });
+  S.dataWs = [];
+  S.receiverReady = false;
+  if (S.ws) { try { S.ws.close(); } catch { /* noop */ } S.ws = null; }
+  // 发送方 WebSocket 关闭后，服务器会自动销毁房间并通知接收方
+  senderResetRound();
+  clearSenderFiles();
+  $('#qrCard').hidden = true;
+  $('#statusCard').hidden = true;
+  $('#btnRestart').hidden = true;
+  $('#btnReset').hidden = true;
+  $('#pickCard').classList.remove('picked');
+  $('#dz').hidden = false;
+  $('#btnClear').hidden = false;
 }
 
 function setSenderStatus(kind, text) {
   $('#stDot').className = 'dot' + (kind ? ' ' + kind : '');
   $('#stText').textContent = text;
 }
+
+// 发送方与接收方共用：更新各自页面上存在的模式徽标
+function setModeBadge(mode) {
+  for (const id of ['modeBadge', 'rBadge']) {
+    const b = document.getElementById(id);
+    if (!b) continue;
+    b.hidden = false;
+    if (mode === 'p2p') { b.textContent = 'P2P 直连'; b.className = 'mode-badge p2p'; }
+    else { b.textContent = '服务器中转'; b.className = 'mode-badge relay'; }
+  }
+}
+
+/* ---------- 并行传输泵 ----------
+ * 每个文件切成 SLOTS 个连续分段，分段 p 走槽位 p；
+ * 各分段并行发送（读预取流水线：读下一块与发送当前块重叠），
+ * 槽位独立背压（bufferedAmount），接收端按段号重组。 */
 
 async function startPump(mode) {
   const T = S.transfer;
@@ -693,46 +670,30 @@ async function startPump(mode) {
   T.mode = mode;
   T.gen = S.gen;
   T.total = S.files.reduce((a, f) => a + f.size, 0);
+  T.fileSent = new Array(S.files.length).fill(0);
   setModeBadge(mode);
   setSenderStatus(mode === 'p2p' ? 'p2p' : '', mode === 'p2p' ? 'P2P 直连已建立，开始传输…' : '已切换服务器中转，开始传输…');
   $('#prog').hidden = false;
   $('#progMeta').hidden = false;
-  sendCtl({ t: 'meta', files: S.files.map((f, i) => fileMeta(f, i)) });
+  sendWsCtl({ t: 'meta', files: S.files.map((f) => fileMeta(f)) });
 
   try {
     for (let i = 0; i < S.files.length; i++) {
-      const f = S.files[i];
       if (T.gen !== S.gen) return;
       T.cur = i;
       if (S.tiles[i]) S.tiles[i].wrap.classList.add('sending');
-      sendCtl({ t: 'file-start', i, ...fileMeta(f, i) });
-      const chunkSize = mode === 'p2p' ? DC_CHUNK : RELAY_CHUNK;
-      let off = 0;
-      while (off < f.size) {
-        if (T.gen !== S.gen) return;
-        const end = Math.min(off + chunkSize, f.size);
-        const buf = await f.slice(off, end).arrayBuffer();
-        if (T.gen !== S.gen) return;
-        const frame = new Uint8Array(2 + buf.byteLength);
-        frame[0] = i & 255;
-        frame[1] = (i >> 8) & 255;
-        frame.set(new Uint8Array(buf), 2);
-        await waitForDrain(mode);
-        if (mode === 'p2p') S.dc.send(frame);
-        else S.ws.send(frame);
-        off = end;
-        T.sent += buf.byteLength;
-        updateSenderProgress(i, (off / f.size) * 100);
-      }
-      sendCtl({ t: 'file-end', i });
-      if (S.tiles[i]) {
-        const t = S.tiles[i];
+      sendWsCtl({ t: 'file-start', i, parts: SLOTS, ...fileMeta(S.files[i]) });
+      await sendFileParallel(i, mode);
+      if (T.gen !== S.gen) return;
+      sendWsCtl({ t: 'file-end', i });
+      const t = S.tiles[i];
+      if (t) {
         t.wrap.classList.remove('sending');
         t.wrap.classList.add('sent');
         t.ring.style.setProperty('--p', 100);
       }
     }
-    sendCtl({ t: 'complete' });
+    sendWsCtl({ t: 'complete' });
     T.finished = true;
     T.sent = T.total;
     $('#progFill').style.width = '100%';
@@ -743,19 +704,56 @@ async function startPump(mode) {
   } catch (e) {
     if (T.gen === S.gen) {
       setSenderStatus('err', '传输出错：' + (e && e.message ? e.message : '连接已断开'));
+      sendWsCtl({ t: 'error' });
       $('#btnReset').hidden = false;
     }
   }
 }
 
-function sendCtl(obj) {
-  if (S.transfer.mode === 'p2p' && S.dc && S.dc.readyState === 'open') S.dc.send(JSON.stringify(obj));
-  else sendWsCtl(obj);
+async function sendFileParallel(i, mode) {
+  const f = S.files[i];
+  const partSize = Math.ceil(f.size / SLOTS);
+  const parts = [];
+  for (let p = 0; p < SLOTS; p++) {
+    parts.push({ start: Math.min(p * partSize, f.size), end: Math.min((p + 1) * partSize, f.size) });
+  }
+  await Promise.all(parts.map((part, p) => (part.start < part.end ? sendPart(i, p, part, f, mode) : Promise.resolve())));
 }
 
-async function waitForDrain(mode) {
+async function sendPart(i, p, part, f, mode) {
+  const T = S.transfer;
+  const chunkSize = mode === 'p2p' ? DC_CHUNK : RELAY_CHUNK;
+  let off = part.start;
+  let pending = readChunk(f, off, Math.min(off + chunkSize, part.end));
+  while (off < part.end) {
+    if (T.gen !== S.gen) return;
+    const buf = await pending;
+    const next = off + buf.byteLength;
+    // 读预取流水线：发送当前块的同时预读下一块
+    pending = next < part.end ? readChunk(f, next, Math.min(next + chunkSize, part.end)) : null;
+    const frame = new Uint8Array(4 + buf.byteLength);
+    frame[0] = i & 255;
+    frame[1] = (i >> 8) & 255;
+    frame[2] = p & 255;
+    frame[3] = (p >> 8) & 255;
+    frame.set(buf, 4);
+    await drainSlot(p, mode);
+    if (T.gen !== S.gen) return;
+    sendSlot(p, mode, frame);
+    off = next;
+    T.sent += buf.byteLength;
+    T.fileSent[i] += buf.byteLength;
+    updateSenderProgress(i, (T.fileSent[i] / f.size) * 100);
+  }
+}
+
+function readChunk(f, from, to) {
+  return f.slice(from, to).arrayBuffer().then((ab) => new Uint8Array(ab));
+}
+
+async function drainSlot(p, mode) {
   if (mode === 'p2p') {
-    const dc = S.dc;
+    const dc = S.dc[p];
     while (dc && dc.readyState === 'open' && dc.bufferedAmount > DC_HIGH_WATER) {
       await new Promise((resolve) => {
         const handler = () => { dc.removeEventListener('bufferedamountlow', handler); resolve(); };
@@ -765,7 +763,20 @@ async function waitForDrain(mode) {
     }
     if (!dc || dc.readyState !== 'open') throw new Error('数据通道已关闭');
   } else {
-    while (S.ws && S.ws.bufferedAmount > RELAY_HIGH_WATER) await sleep(20);
+    while (S.dataWs[p] && S.dataWs[p].readyState === 1 && S.dataWs[p].bufferedAmount > RELAY_HIGH_WATER) {
+      await sleep(20);
+    }
+  }
+}
+
+function sendSlot(p, mode, frame) {
+  if (mode === 'p2p') {
+    if (!S.dc[p] || S.dc[p].readyState !== 'open') throw new Error('数据通道已关闭');
+    S.dc[p].send(frame);
+  } else {
+    const ws = S.dataWs[p];
+    if (!ws || ws.readyState !== 1) throw new Error('数据连接已关闭');
+    ws.send(frame);
   }
 }
 
@@ -797,11 +808,16 @@ let R = null; // 接收方状态
 function initReceiver() {
   R = {
     room: ROOM,
-    ws: null,
+    ws: null,          // 控制 WebSocket
+    dataWs: [],        // 中转模式的数据 WebSocket（按槽位）
+    dataWsOpen: 0,
+    readySent: false,
     pc: null,
-    dc: null,
+    dc: [],            // P2P DataChannel（按槽位）
+    dcOpen: 0,
     metas: null,
-    pending: new Map(), // i -> {meta, chunks, got}
+    pending: new Map(), // i -> {meta, parts: [][SLOTS], got}
+    finalized: new Set(),
     mode: null,
     decided: false,
     got: 0,
@@ -809,7 +825,7 @@ function initReceiver() {
     received: 0,
     completeSeen: false,
     items: [], // {meta, url}
-    tiles: [], // {wrap, ring, check, inner, filled} 与发送方一致的缩略图网格
+    tiles: [], // {wrap, ring, check, inner, filled} 缩略图网格
     lastUi: 0,
     lastBytes: 0,
     lastTime: 0,
@@ -848,19 +864,41 @@ function initReceiver() {
 }
 
 function openReceiverWs() {
-  const ws = new WebSocket(wsUrl(R.room, 'receiver'));
+  const ws = new WebSocket(wsUrl(ROOM, 'receiver'));
   ws.binaryType = 'arraybuffer';
   R.ws = ws;
-  ws.onopen = () => setReceiverStatus('', '已连接，等待发送方…');
+  ws.onopen = () => {
+    setReceiverStatus('', '已连接，等待发送方…');
+    openReceiverDataWs();
+  };
   ws.onmessage = (ev) => {
     if (typeof ev.data === 'string') receiverOnCtl(JSON.parse(ev.data));
-    else onBinaryChunk(ev.data);
   };
   ws.onclose = () => {
     if (!R.completeSeen || R.received < R.metas.length) {
       setReceiverStatus('err', '与服务器的连接已断开，请刷新重试');
     }
   };
+}
+
+// 数据槽位提前连接好，中转决策后立即可用
+function openReceiverDataWs() {
+  for (let p = 0; p < SLOTS; p++) {
+    const ws = new WebSocket(wsUrl(ROOM, 'receiver', p));
+    ws.binaryType = 'arraybuffer';
+    ws.onmessage = (ev) => { if (typeof ev.data !== 'string') onBinaryChunk(ev.data); };
+    ws.onopen = () => {
+      R.dataWsOpen++;
+      maybeSendReady();
+    };
+    R.dataWs.push(ws);
+  }
+}
+
+function maybeSendReady() {
+  if (R.readySent || R.mode !== 'relay' || R.dataWsOpen < SLOTS) return;
+  R.readySent = true;
+  sendReceiverCtl({ t: 'ready' });
 }
 
 function setReceiverStatus(kind, text) {
@@ -886,18 +924,18 @@ function receiverOnCtl(msg) {
       if (R.pc && msg.candidate) R.pc.addIceCandidate(msg.candidate).catch(() => {});
       break;
     case 'file-start': {
-      R.pending.set(msg.i, {
-        meta: { name: msg.name, size: msg.size, mime: msg.mime },
-        chunks: [],
-        got: 0,
-      });
-      const t = R.tiles && R.tiles[msg.i];
-      if (t) t.wrap.classList.add('sending');
+      if (R.finalized.has(msg.i)) break; // 已完成的文件收到迟到的控制帧，忽略
+      ensurePending(msg.i, { name: msg.name, size: msg.size, mime: msg.mime });
       break;
     }
-    case 'file-end':
-      finalizeFile(msg.i);
+    case 'file-end': {
+      const st = R.pending.get(msg.i);
+      if (st && st.got >= st.meta.size && !R.finalized.has(msg.i)) {
+        R.finalized.add(msg.i);
+        finalizeFile(msg.i);
+      }
       break;
+    }
     case 'complete':
       R.completeSeen = true;
       maybeAllDone();
@@ -907,67 +945,49 @@ function receiverOnCtl(msg) {
       break;
     case 'room-closed':
       setReceiverStatus('err', '发送方已关闭，请重新扫码');
+      closeReceiverDataWs();
       break;
   }
 }
 
-function renderReceiverFiles(files) {
-  if (!files || !files.length) return;
-  const first = !R.metas;
-  R.metas = files;
-  R.total = files.reduce((a, f) => a + f.size, 0);
-  if (!first) return; // 传输开始的重复 meta，不重复渲染
-  $('#rWait').hidden = true;
-  $('#rMain').hidden = false;
-  $('#rTitle').textContent = `准备接收 ${files.length} 个文件 · ${fmtBytes(R.total)}`;
-  const ul = $('#rList');
-  ul.innerHTML = '';
-  R.tiles = files.map((f) => {
-    const kind = fileKind(f.name, f.mime);
-    const tag = f.live ? 'Live' : kind;
-    const ph = kind === '图片' ? '🖼️' : kind === '视频' ? '🎬' : '📄';
-    const li = h(`<li class="fitem">
-      <div class="thumbwrap" style="--p:0">
-        <div class="ring"></div>
-        <div class="thumb-inner">${ph}</div>
-        <span class="ftag">${tag}</span>
-        <span class="check" hidden>✓</span>
-      </div>
-      <div class="fname"></div>
-      <div class="fsize">${fmtBytes(f.size)}</div>
-    </li>`);
-    li.querySelector('.fname').textContent = f.name;
-    ul.appendChild(li);
-    return {
-      wrap: li.querySelector('.thumbwrap'),
-      ring: li.querySelector('.ring'),
-      check: li.querySelector('.check'),
-      inner: li.querySelector('.thumb-inner'),
-      filled: false,
-    };
-  });
-  setReceiverStatus('', '等待发送方开始传输…');
+function ensurePending(i, meta) {
+  let st = R.pending.get(i);
+  if (st) return st;
+  if (R.finalized.has(i)) return null; // 已完成，忽略迟到的控制帧
+  st = {
+    meta,
+    parts: Array.from({ length: SLOTS }, () => []),
+    got: 0,
+  };
+  R.pending.set(i, st);
+  const t = R.tiles && R.tiles[i];
+  if (t) { t.wrap.classList.add('sending'); }
+  $('#rProg').hidden = false;
+  $('#rProgMeta').hidden = false;
+  return st;
 }
 
 async function receiverWebRTC(offerSdp) {
   const pc = new RTCPeerConnection(ICE_SERVERS);
   R.pc = pc;
+  R.dc = [];
+  R.dcOpen = 0;
   pc.ondatachannel = (e) => {
     const dc = e.channel;
-    R.dc = dc;
+    R.dc.push(dc);
     dc.binaryType = 'arraybuffer';
     dc.onmessage = (ev) => {
       if (typeof ev.data === 'string') receiverOnCtl(JSON.parse(ev.data));
       else onBinaryChunk(ev.data);
     };
     dc.onopen = () => {
+      R.dcOpen++;
       if (!R.decided) {
         R.decided = true;
         R.mode = 'p2p';
         setModeBadge('p2p');
         setReceiverStatus('p2p', 'P2P 直连已建立，自动接收中…');
-      } else if (R.mode === 'relay') {
-        try { dc.close(); } catch { /* noop */ }
+        closeReceiverDataWs(); // P2P 可用，中转通道不再需要
       }
     };
   };
@@ -992,36 +1012,84 @@ function receiverRelayFallback() {
   if (R.decided) return;
   R.decided = true;
   R.mode = 'relay';
-  if (R.pc) { try { R.pc.close(); } catch { /* noop */ } R.pc = null; R.dc = null; }
+  if (R.pc) { try { R.pc.close(); } catch { /* noop */ } R.pc = null; R.dc = []; }
   setModeBadge('relay');
   setReceiverStatus('', '无法 P2P 直连，已切换服务器中转…');
-  sendReceiverCtl({ t: 'relay-mode' });
+  sendReceiverCtl({ t: 'relay-mode' }); // 通知发送方也切换到中转
+  maybeSendReady();
+}
+
+function closeReceiverDataWs() {
+  R.dataWs.forEach((w) => { try { w.close(); } catch { /* noop */ } });
+  R.dataWs = [];
+  R.dataWsOpen = 0;
 }
 
 function sendReceiverCtl(obj) {
   if (R.ws && R.ws.readyState === 1) R.ws.send(JSON.stringify(obj));
 }
 
-// 发送方与接收方共用：更新各自页面上存在的模式徽标
-function setModeBadge(mode) {
-  for (const id of ['modeBadge', 'rBadge']) {
-    const b = document.getElementById(id);
-    if (!b) continue;
-    b.hidden = false;
-    if (mode === 'p2p') { b.textContent = 'P2P 直连'; b.className = 'mode-badge p2p'; }
-    else { b.textContent = '服务器中转'; b.className = 'mode-badge relay'; }
-  }
+function renderReceiverFiles(files) {
+  if (!files || !files.length) return;
+  const first = !R.metas;
+  R.metas = files;
+  R.total = files.reduce((a, f) => a + f.size, 0);
+  if (!first) return; // 传输开始的重复 meta，不重复渲染
+  $('#rWait').hidden = true;
+  $('#rMain').hidden = false;
+  $('#rTitle').textContent = `准备接收 ${files.length} 个文件 · ${fmtBytes(R.total)}`;
+  const ul = $('#rList');
+  ul.innerHTML = '';
+  R.tiles = files.map((f) => {
+    const kind = fileKind(f.name, f.mime);
+    const ph = kind === '图片' ? '🖼️' : kind === '视频' ? '🎬' : '📄';
+    const li = h(`<li class="fitem">
+      <div class="thumbwrap" style="--p:0">
+        <div class="ring"></div>
+        <div class="thumb-inner">${ph}</div>
+        <span class="ftag">${kind}</span>
+        <span class="check" hidden>✓</span>
+      </div>
+      <div class="fname"></div>
+      <div class="fsize">${fmtBytes(f.size)}</div>
+    </li>`);
+    li.querySelector('.fname').textContent = f.name;
+    ul.appendChild(li);
+    return {
+      wrap: li.querySelector('.thumbwrap'),
+      ring: li.querySelector('.ring'),
+      check: li.querySelector('.check'),
+      inner: li.querySelector('.thumb-inner'),
+      filled: false,
+    };
+  });
+  setReceiverStatus('', '等待发送方开始传输…');
 }
 
 function onBinaryChunk(buf) {
   const u = new Uint8Array(buf);
-  if (u.length < 2) return;
+  if (u.length < 4) return;
   const i = u[0] | (u[1] << 8);
-  const st = R.pending.get(i);
+  const partId = u[2] | (u[3] << 8);
+  if (partId >= SLOTS) return;
+  // 控制帧（WebSocket）与数据帧（DataChannel/数据 WebSocket）可能乱序到达，
+  // 二进制先到时从已缓存的文件清单兜底建立接收状态
+  let st = R.pending.get(i);
+  if (!st && R.metas && R.metas[i]) {
+    st = ensurePending(i, R.metas[i]);
+  }
   if (!st) return;
-  st.chunks.push(u.subarray(2));
-  st.got += u.byteLength - 2;
-  R.got += u.byteLength - 2;
+  const chunk = u.subarray(4);
+  st.parts[partId].push(chunk);
+  st.got += chunk.length;
+  R.got += chunk.length;
+  if (st.got >= st.meta.size) {
+    if (!R.finalized.has(i)) {
+      R.finalized.add(i);
+      finalizeFile(i);
+    }
+    return;
+  }
   updateReceiverProgress(i, st.meta.size ? (st.got / st.meta.size) * 100 : 100);
 }
 
@@ -1049,8 +1117,8 @@ function updateReceiverProgress(i, filePct, force) {
 function finalizeFile(i) {
   const st = R.pending.get(i);
   if (!st) return;
-  const blob = new Blob(st.chunks, { type: st.meta.mime || '' });
-  st.chunks.length = 0;
+  const blob = new Blob(st.parts.flat(), { type: st.meta.mime || '' });
+  st.parts = null;
   R.pending.delete(i);
   const url = URL.createObjectURL(blob);
   R.items.push({ meta: st.meta, url });
@@ -1132,86 +1200,87 @@ function maybeAllDone() {
   $('#saveAllWrap').hidden = false;
 }
 
+/* ---------- 方向/镜像归一化 ----------
+ * iPhone 的实况/自拍方向与前置镜像效果存放在 HEIC/EXIF 元数据里，不同查看器解释
+ * 不一致会导致接收方看到被"反转回去"的图片。发送前用浏览器解码（与拍照预览同一
+ * 解码器，所见即所得）把像素烘焙成 JPEG，保证任何设备上显示完全一致。
+ * PNG、视频保持字节原样；无方向标记的 JPEG 也不重编码。 */
+
+function jpegOrientation(buf) {
+  // 兼容 ArrayBuffer 输入（File.slice().arrayBuffer() 的返回值）
+  if (!(buf instanceof Uint8Array)) buf = new Uint8Array(buf);
+  if (buf.length < 4 || buf[0] !== 0xFF || buf[1] !== 0xD8) return 1;
+  let o = 2;
+  while (o + 4 < buf.length) {
+    if (buf[o] !== 0xFF) { o++; continue; }
+    const marker = buf[o + 1];
+    if (marker === 0xFF) { o++; continue; }
+    if (marker === 0xD8 || (marker >= 0xD0 && marker <= 0xD7) || marker === 0x01) { o += 2; continue; }
+    if (marker === 0xD9 || marker === 0xDA) break; // EOI / SOS：EXIF 只在前面
+    const len = (buf[o + 2] << 8) | buf[o + 3];
+    if (marker === 0xE1 && len > 10 &&
+        buf[o + 4] === 0x45 && buf[o + 5] === 0x78 && buf[o + 6] === 0x69 &&
+        buf[o + 7] === 0x66 && buf[o + 8] === 0x00 && buf[o + 9] === 0x00) {
+      const tiff = o + 10;
+      const le = buf[tiff] === 0x49 && buf[tiff + 1] === 0x49;
+      const rd16 = (p) => le ? buf[p] | (buf[p + 1] << 8) : (buf[p] << 8) | buf[p + 1];
+      const rd32 = (p) => le
+        ? (buf[p] | (buf[p + 1] << 8) | (buf[p + 2] << 16) | (buf[p + 3] << 24))
+        : ((buf[p] << 24) | (buf[p + 1] << 16) | (buf[p + 2] << 8) | buf[p + 3]);
+      const ifd = tiff + rd32(tiff + 4);
+      const count = rd16(ifd);
+      for (let k = 0; k < count; k++) {
+        const e = ifd + 2 + k * 12;
+        if (rd16(e) === 0x0112) return rd16(e + 8); // Orientation
+      }
+      return 1;
+    }
+    o += 2 + len;
+  }
+  return 1;
+}
+
+async function bakeImage(f) {
+  const url = URL.createObjectURL(f);
+  try {
+    const img = new Image();
+    await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = url; });
+    const area = img.naturalWidth * img.naturalHeight;
+    const scale = Math.min(1, Math.sqrt((16 * 1024 * 1024) / area)); // 兼容 iOS 画布面积上限
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(img.naturalWidth * scale));
+    c.height = Math.max(1, Math.round(img.naturalHeight * scale));
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+    const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.95));
+    if (!blob) return null;
+    const name = f.name.replace(/\.(heic|heif|jpe?g|tiff?)$/i, '') + '.jpg';
+    return new File([blob], name, { type: 'image/jpeg', lastModified: f.lastModified });
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function normalizeOrientations() {
+  for (let i = 0; i < S.files.length; i++) {
+    const f = S.files[i];
+    try {
+      const isPng = f.type === 'image/png' || /\.png$/i.test(f.name);
+      const isHeic = /\.(heic|heif)$/i.test(f.name) || f.type === 'image/heic' || f.type === 'image/heif';
+      const isJpg = /\.(jpe?g)$/i.test(f.name) || f.type === 'image/jpeg';
+      if (isPng || (!isHeic && !isJpg)) continue;
+      if (isJpg && jpegOrientation(await f.slice(0, 262144).arrayBuffer()) === 1) continue;
+      const replaced = await bakeImage(f);
+      if (replaced) S.files[i] = replaced;
+    } catch { /* 解码失败（如桌面端无 HEIC 解码器）则保持原文件 */ }
+  }
+}
+
 /* ================= 启动与测试钩子 ================= */
 
 renderShell();
 if (ROOM) initReceiver();
 else bootSender();
 
-// 发送方启动：先过密钥门禁（30 天有效），通过后才进入传输任务界面
-async function bootSender() {
-  let required = true;
-  let days = 30;
-  try {
-    const r = await fetch('/api/auth/info');
-    const j = await r.json();
-    required = !!j.required;
-    days = j.days || 30;
-  } catch { /* 服务不可达时直接进入，后续操作会给出明确错误 */ }
-
-  if (required) {
-    const saved = localStorage.getItem('imgport.token');
-    if (saved) {
-      try {
-        const r = await fetch('/api/auth/check?token=' + encodeURIComponent(saved));
-        if (r.ok) { initSender(); return; }
-      } catch { /* 网络异常则按未登录处理 */ }
-      localStorage.removeItem('imgport.token');
-    }
-    renderKeyGate(days);
-    return;
-  }
-  initSender();
-}
-
-function renderKeyGate(days) {
-  $('#main').innerHTML = `
-    <section class="card center key-card">
-      <div class="key-icon">
-        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15" r="1.4" fill="#fff" stroke="none"/>
-        </svg>
-      </div>
-      <h2>请输入访问密钥</h2>
-      <p class="muted" style="margin:0 0 18px">本服务仅供授权使用，验证后 ${days} 天内免输入</p>
-      <input type="password" id="keyInput" class="key-input" placeholder="访问密钥" autocomplete="off" autofocus>
-      <button class="btn block" id="btnKey">进入</button>
-      <div class="banner err" id="keyErr" hidden></div>
-    </section>
-  `;
-  $('#btnKey').addEventListener('click', submitKey);
-  $('#keyInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') submitKey(); });
-  $('#keyInput').focus();
-}
-
-async function submitKey() {
-  const key = $('#keyInput').value.trim();
-  if (!key) { $('#keyInput').focus(); return; }
-  const btn = $('#btnKey');
-  btn.disabled = true;
-  btn.textContent = '验证中…';
-  try {
-    const r = await fetch('/api/auth', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ key }),
-    });
-    if (!r.ok) throw new Error('密钥错误，请重新输入');
-    const j = await r.json();
-    localStorage.setItem('imgport.token', j.token);
-    $('#main').innerHTML = '';
-    initSender();
-  } catch (e) {
-    const err = $('#keyErr');
-    err.hidden = false;
-    err.textContent = e.message || '验证失败，请重试';
-    btn.disabled = false;
-    btn.textContent = '进入';
-    $('#keyInput').select();
-  }
-}
-
-// 供自动化测试/调试使用
 window.__test = {
   sender: {
     addFiles: (files) => addSenderFiles(files),

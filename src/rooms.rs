@@ -1,7 +1,8 @@
 //! 房间域：房间数据结构、连接登记簿与生命周期管理。
 //!
-//! 登记簿只暴露语义化操作（登记/注销/取对端/续活/回收），
-//! WebSocket 层不接触内部数据结构，保证高内聚低耦合。
+//! 每个房间有两条控制连接（收/发各一，走信令与控制消息）和若干数据槽位
+//! （收/发各 SLOTS 条，按槽位号 1:1 转发二进制数据，用于并行传输）。
+//! 登记簿只暴露语义化操作，WebSocket 层不接触内部数据结构。
 
 use std::{
     collections::HashMap,
@@ -21,10 +22,15 @@ use serde_json::{json, Value};
 
 use crate::state::{AppState, ClientTx};
 
-/// 房间内单个客户端连接的登记信息。
+/// 数据槽位数量：并行传输的通道数（收发双方各开同数量连接）。
+pub const SLOTS: u16 = 3;
+
+/// 房间内连接的登记信息。
 struct Room {
-    sender: Option<ClientTx>,
-    receiver: Option<ClientTx>,
+    sender_ctl: Option<ClientTx>,
+    sender_data: HashMap<u16, ClientTx>,
+    receiver_ctl: Option<ClientTx>,
+    receiver_data: HashMap<u16, ClientTx>,
     /// 发送方最后一次广播的文件清单，接收方（含断线重连）加入时补发。
     meta: Option<Value>,
     last_active: Instant,
@@ -33,25 +39,34 @@ struct Room {
 impl Room {
     fn new() -> Self {
         Self {
-            sender: None,
-            receiver: None,
+            sender_ctl: None,
+            sender_data: HashMap::new(),
+            receiver_ctl: None,
+            receiver_data: HashMap::new(),
             meta: None,
             last_active: Instant::now(),
         }
     }
 }
 
-/// 接收方登记结果：被顶替的旧连接与房间缓存的文件清单。
+/// 接收方控制连接登记结果：被顶替的旧连接与房间缓存的文件清单。
 pub struct ReceiverJoin {
     pub replaced_tx: Option<ClientTx>,
     pub meta: Option<Value>,
 }
 
 pub enum UnregisterOutcome {
-    /// 发送方注销：房间随之移除，`receiver` 为需要通知关闭的对端。
-    SenderRemoved { receiver: Option<ClientTx> },
-    /// 接收方注销：`sender` 为需要通知的对端。
-    ReceiverRemoved { sender: Option<ClientTx> },
+    /// 发送方控制连接注销：房间随之移除。
+    /// `receiver_ctl` 需要收到关闭通知；`close_list` 为所有数据槽位（需发送 Close）。
+    SenderRemoved {
+        receiver_ctl: Option<ClientTx>,
+        close_list: Vec<ClientTx>,
+    },
+    /// 接收方控制连接注销：`sender_ctl` 需要收到通知；`close_list` 为接收方数据槽位。
+    ReceiverRemoved {
+        sender_ctl: Option<ClientTx>,
+        close_list: Vec<ClientTx>,
+    },
     /// 槽位已被顶替或房间不存在，无需处理。
     NotOwner,
 }
@@ -93,28 +108,45 @@ impl RoomRegistry {
     pub fn snapshot(&self, id: &str) -> Option<RoomSnapshot> {
         let rooms = self.0.lock().unwrap();
         rooms.get(id).map(|room| RoomSnapshot {
-            sender_online: room.sender.is_some(),
+            sender_online: room.sender_ctl.is_some(),
             meta: room.meta.clone(),
         })
     }
 
-    /// 发送方登记：房间不存在则补建；返回被顶替的旧连接（调用方负责关闭）。
-    pub fn register_sender(&self, id: &str, tx: ClientTx) -> Option<ClientTx> {
+    /// 控制连接登记：发送方不存在则补建房间；返回被顶替的旧连接。
+    pub fn register_ctl(
+        &self,
+        id: &str,
+        is_sender: bool,
+        tx: ClientTx,
+    ) -> Option<(Option<ClientTx>, Option<Value>)> {
         let mut rooms = self.0.lock().unwrap();
         let room = rooms.entry(id.to_string()).or_insert_with(Room::new);
         room.last_active = Instant::now();
-        room.sender.replace(tx)
+        let slot = if is_sender {
+            &mut room.sender_ctl
+        } else {
+            &mut room.receiver_ctl
+        };
+        let old = slot.replace(tx);
+        let meta = if is_sender { None } else { room.meta.clone() };
+        Some((old, meta))
     }
 
-    /// 接收方登记：房间不存在返回 None；顶替旧连接并带回缓存清单。
-    pub fn register_receiver(&self, id: &str, tx: ClientTx) -> Option<ReceiverJoin> {
+    /// 数据槽位登记：房间不存在返回 false。
+    pub fn register_data(&self, id: &str, is_sender: bool, slot: u16, tx: ClientTx) -> bool {
         let mut rooms = self.0.lock().unwrap();
-        let room = rooms.get_mut(id)?;
+        let Some(room) = rooms.get_mut(id) else {
+            return false;
+        };
         room.last_active = Instant::now();
-        Some(ReceiverJoin {
-            replaced_tx: room.receiver.replace(tx),
-            meta: room.meta.clone(),
-        })
+        let map = if is_sender {
+            &mut room.sender_data
+        } else {
+            &mut room.receiver_data
+        };
+        map.insert(slot, tx);
+        true
     }
 
     pub fn touch(&self, id: &str) {
@@ -123,16 +155,29 @@ impl RoomRegistry {
         }
     }
 
-    /// 取对端出站通道并顺带续活。
-    pub fn peer_tx(&self, id: &str, from_sender: bool) -> Option<ClientTx> {
+    /// 取对端控制通道并顺带续活。
+    pub fn peer_ctl_tx(&self, id: &str, from_sender: bool) -> Option<ClientTx> {
         let mut rooms = self.0.lock().unwrap();
         let room = rooms.get_mut(id)?;
         room.last_active = Instant::now();
         if from_sender {
-            room.receiver.clone()
+            room.receiver_ctl.clone()
         } else {
-            room.sender.clone()
+            room.sender_ctl.clone()
         }
+    }
+
+    /// 取对端同号数据槽位并顺带续活；对端未上线时返回 None（帧丢弃）。
+    pub fn peer_data_tx(&self, id: &str, from_sender: bool, slot: u16) -> Option<ClientTx> {
+        let mut rooms = self.0.lock().unwrap();
+        let room = rooms.get_mut(id)?;
+        room.last_active = Instant::now();
+        let map = if from_sender {
+            &room.receiver_data
+        } else {
+            &room.sender_data
+        };
+        map.get(&slot).cloned()
     }
 
     pub fn store_meta(&self, id: &str, meta: Value) {
@@ -142,25 +187,49 @@ impl RoomRegistry {
         }
     }
 
-    /// 注销连接；仅当 `tx` 仍持有槽位时生效，避免误伤顶替上来的新连接。
-    pub fn unregister(&self, id: &str, is_sender: bool, tx: &ClientTx) -> UnregisterOutcome {
+    /// 注销控制连接；仅当 `tx` 仍持有槽位时生效，避免误伤顶替上来的新连接。
+    pub fn unregister_ctl(&self, id: &str, is_sender: bool, tx: &ClientTx) -> UnregisterOutcome {
         let mut rooms = self.0.lock().unwrap();
         let Some(room) = rooms.get_mut(id) else {
             return UnregisterOutcome::NotOwner;
         };
         let mine =
             |slot: &Option<ClientTx>| slot.as_ref().map(|t| t.same_channel(tx)).unwrap_or(false);
-        if is_sender && mine(&room.sender) {
-            let receiver = room.receiver.take();
+        if is_sender && mine(&room.sender_ctl) {
+            let mut close_list: Vec<ClientTx> = room.sender_data.values().cloned().collect();
+            close_list.extend(room.receiver_data.values().cloned());
+            let receiver_ctl = room.receiver_ctl.clone();
             rooms.remove(id);
-            UnregisterOutcome::SenderRemoved { receiver }
-        } else if !is_sender && mine(&room.receiver) {
-            room.receiver = None;
+            UnregisterOutcome::SenderRemoved {
+                receiver_ctl,
+                close_list,
+            }
+        } else if !is_sender && mine(&room.receiver_ctl) {
+            room.receiver_ctl = None;
+            let close_list: Vec<ClientTx> = room.receiver_data.values().cloned().collect();
+            room.receiver_data.clear();
             UnregisterOutcome::ReceiverRemoved {
-                sender: room.sender.clone(),
+                sender_ctl: room.sender_ctl.clone(),
+                close_list,
             }
         } else {
             UnregisterOutcome::NotOwner
+        }
+    }
+
+    /// 注销数据槽位（连接断开时自清理）。
+    pub fn unregister_data(&self, id: &str, is_sender: bool, slot: u16, tx: &ClientTx) {
+        let mut rooms = self.0.lock().unwrap();
+        let Some(room) = rooms.get_mut(id) else {
+            return;
+        };
+        let map = if is_sender {
+            &mut room.sender_data
+        } else {
+            &mut room.receiver_data
+        };
+        if map.get(&slot).map(|t| t.same_channel(tx)).unwrap_or(false) {
+            map.remove(&slot);
         }
     }
 
