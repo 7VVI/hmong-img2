@@ -1,0 +1,9 @@
+target/
+imgport-target/
+release/
+*.md
+*.tar
+*.tar.gz
+.git/
+.dockerignore
+Dockerfile

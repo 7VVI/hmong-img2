@@ -1,0 +1,26 @@
+# imgport 部署文件
+#
+# 离线部署（配合 release/imgport-latest.tar）：
+#   1. 导入镜像： docker load -i imgport-latest.tar
+#   2. 修改下方 KEY 为你的访问密钥
+#   3. 启动：     docker compose up -d
+#   4. 停止：     docker compose down
+#
+# 在线部署（源码目录内）：取消注释 build 行并注释 image 行，然后 docker compose up -d --build
+
+services:
+  imgport:
+    image: imgport:latest
+    # build: .
+    container_name: imgport
+    ports:
+      - "8080:8080"
+    environment:
+      # 发送方访问密钥（验证后 30 天免输入）；改为 off 关闭门禁
+      KEY: "change-me"
+      # PORT: "8080"        # 容器内监听端口（ports 左侧为对外端口）
+      # ROOM_TTL: "1800"    # 房间空闲回收秒数，默认 1800
+      # MAX_ROOMS: "512"    # 同时存在的最大房间数
+      # RUST_LOG: "imgport=info"
+    restart: unless-stopped
+    # 镜像内已自带健康检查（/healthz），此处无需重复配置
