@@ -152,7 +152,7 @@ function initSender() {
         <span class="total-hint" id="totalHint"></span>
         <span class="sel-actions">
           <button class="link" id="btnClear">清空</button>
-          <button class="btn" id="btnStart" hidden>生成二维码，开始发送</button>
+          <button class="btn" id="btnStart" hidden>开始发送</button>
         </span>
       </div>
       <ul class="fgrid" id="fileList"></ul>
@@ -425,7 +425,7 @@ async function beginSend() {
   await normalizeOrientations((done, total) => {
     btn.textContent = `正在处理图片 ${done}/${total}…`;
   });
-  btn.textContent = '生成二维码，开始发送';
+  btn.textContent = '开始发送';
   renderSenderFiles();
   $('#pickCard').classList.add('picked');
   $('#dz').hidden = true;
