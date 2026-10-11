@@ -179,7 +179,10 @@ body {
   justify-content: space-between;
   gap: 14px;
   margin-top: 18px;
+  flex-wrap: wrap;
 }
+
+.sel-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 
 .total-hint { font-size: 14px; color: var(--text); font-weight: 600; }
 .total-hint b { color: var(--accent); font-weight: 700; }
@@ -451,7 +454,19 @@ body {
 
 /* ---------- 二维码面板 ---------- */
 
-.qr-wrap { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+.panel-title { margin: 0 0 14px; font-size: 15px; font-weight: 600; }
+
+.qr-row { display: flex; gap: 22px; align-items: flex-start; flex-wrap: wrap; }
+
+.send-info {
+  flex: 1;
+  min-width: 240px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.send-info .join-url { width: 100%; }
 
 .qr-box-wrap { position: relative; }
 

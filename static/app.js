@@ -114,6 +114,30 @@ function initSender() {
 
   $('#main').innerHTML = `
     <section class="card" id="pickCard">
+      <!-- 发送面板：生成后置顶显示（二维码 + 状态进度），文件预览在下方 -->
+      <div id="sendPanel" hidden>
+        <h2 class="panel-title">用接收方手机扫码</h2>
+        <div class="qr-row">
+          <div class="qr-box-wrap">
+            <div class="qr-box loading" id="qrBox">二维码生成中…</div>
+            <button class="qr-refresh" id="btnReqr" title="刷新二维码">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/>
+              </svg>
+            </button>
+          </div>
+          <div class="send-info">
+            <div class="status-line"><span class="dot" id="stDot"></span><span id="stText">等待接收方扫码…</span><span class="mode-badge" id="modeBadge" hidden></span></div>
+            <div class="progress" id="prog" hidden><div class="fill" id="progFill"></div></div>
+            <div class="progress-meta" id="progMeta" hidden><span id="progBytes"></span><span id="progSpeed"></span></div>
+            <div class="join-url">
+              <input id="joinUrl" spellcheck="false" title="接收方访问的地址，可改成局域网 IP 或公网域名">
+              <button class="btn ghost" id="btnCopy">复制链接</button>
+            </div>
+            <div class="banner err" id="errBanner" hidden></div>
+          </div>
+        </div>
+      </div>
       <div class="dropzone" id="dz">
         <span class="dz-circle">
           <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -126,34 +150,12 @@ function initSender() {
       <input type="file" id="picker" multiple hidden>
       <div class="sel-bar" id="selBar" hidden>
         <span class="total-hint" id="totalHint"></span>
-        <button class="link" id="btnClear">清空</button>
+        <span class="sel-actions">
+          <button class="link" id="btnClear">清空</button>
+          <button class="btn" id="btnStart" hidden>生成二维码，开始发送</button>
+        </span>
       </div>
       <ul class="fgrid" id="fileList"></ul>
-      <button class="btn block" id="btnStart" hidden>生成二维码，开始发送</button>
-    </section>
-    <section class="card" id="qrCard" hidden>
-      <h2>用接收方手机扫码</h2>
-      <div class="qr-wrap">
-        <div class="qr-box-wrap">
-          <div class="qr-box loading" id="qrBox">二维码生成中…</div>
-          <button class="qr-refresh" id="btnReqr" title="刷新二维码">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/>
-            </svg>
-          </button>
-        </div>
-        <div class="join-url">
-          <input id="joinUrl" spellcheck="false" title="接收方访问的地址，可改成局域网 IP 或公网域名">
-          <button class="btn ghost" id="btnCopy">复制链接</button>
-        </div>
-      </div>
-    </section>
-    <section class="card" id="statusCard" hidden>
-      <h2>传输状态</h2>
-      <div class="status-line"><span class="dot" id="stDot"></span><span id="stText">等待接收方扫码…</span><span class="mode-badge" id="modeBadge" hidden></span></div>
-      <div class="progress" id="prog" hidden><div class="fill" id="progFill"></div></div>
-      <div class="progress-meta" id="progMeta" hidden><span id="progBytes"></span><span id="progSpeed"></span></div>
-      <div class="banner err" id="errBanner" hidden></div>
     </section>
   `;
 
@@ -448,8 +450,7 @@ async function beginSend() {
     return;
   }
 
-  $('#qrCard').hidden = false;
-  $('#statusCard').hidden = false;
+  $('#sendPanel').hidden = false;
   $('#btnRestart').hidden = false;
   $('#btnReset').hidden = true;
   $('#joinUrl').value = `${location.origin}/?r=${S.room}`;
@@ -682,8 +683,7 @@ function restartSend() {
   // 发送方 WebSocket 关闭后，服务器会自动销毁房间并通知接收方
   senderResetRound();
   clearSenderFiles();
-  $('#qrCard').hidden = true;
-  $('#statusCard').hidden = true;
+  $('#sendPanel').hidden = true;
   $('#btnRestart').hidden = true;
   $('#btnReset').hidden = true;
   $('#pickCard').classList.remove('picked');
@@ -893,12 +893,12 @@ function initReceiver() {
         <div class="progress-meta" id="rProgMeta" hidden><span id="rProgBytes"></span><span id="rProgSpeed"></span></div>
         <ul class="fgrid" id="rList"></ul>
         <div class="banner err" id="rErr" hidden></div>
-        <div style="margin-top:14px" id="saveAllWrap" hidden>
-          <button class="btn ghost" id="btnSaveAll">保存全部</button>
-        </div>
       </div>
     </section>
   `;
+  // 顶部栏右侧的快捷操作：有文件落地后可用
+  $('#heroActions').hidden = false;
+  $('#heroActions').innerHTML = `<button class="btn ghost sm" id="btnSaveAll" hidden>保存全部</button>`;
   $('#btnSaveAll').addEventListener('click', saveAll);
 
   fetch('/api/rooms/' + encodeURIComponent(ROOM))
@@ -1204,7 +1204,7 @@ function finalizeFile(i) {
     t.wrap.appendChild(saveBtn);
   }
   autoDownload(st.meta, url, R.items.length * 350);
-  $('#saveAllWrap').hidden = false;
+  $('#btnSaveAll').hidden = false;
   sendReceiverCtl({ t: 'received', i });
   maybeAllDone();
 }
@@ -1246,7 +1246,7 @@ function maybeAllDone() {
   R.got = R.total;
   updateReceiverProgress(null, 100, true);
   setReceiverStatus('ok', '全部接收完成');
-  $('#saveAllWrap').hidden = false;
+  $('#btnSaveAll').hidden = false;
 }
 
 /* ---------- 方向/镜像归一化 ----------
