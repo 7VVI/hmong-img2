@@ -587,7 +587,6 @@ body {
 
 .banner.ok { background: #e9f9f0; border: 1px solid #b5e8c9; color: #15803d; }
 .banner.err { background: #fdeeee; border: 1px solid #f5c2c7; color: #b91c1c; }
-.banner.warn { background: #fff7ea; border: 1px solid #fde1b8; color: #92600a; font-size: 13px; line-height: 1.9; }
 .banner[hidden] { display: none; }
 
 /* ---------- 密钥门禁 ---------- */

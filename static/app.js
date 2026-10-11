@@ -112,12 +112,6 @@ function initSender() {
       <!-- 不设 accept：iOS 弹出系统面板（照片图库/拍摄/选取文件），「选取文件」可进入文件 App
            选择 Live Photo 原始对，且照片图库路径返回原始 HEIC 不转码 -->
       <input type="file" id="picker" multiple hidden>
-      <div class="banner warn" id="liveBanner" hidden>
-        <div>检测到实况照片（Live Photo），但 iOS 相册只提供了静态画面。发送前请：<br>
-        1. 在相册中分享该照片 → <b>存储到文件</b>（会导出 .HEIC + .mov 两个文件）<br>
-        2. 回到这里点选择框 → 面板中选<b>「选取文件」</b> → 同时选中这两个文件<br>
-        这样接收方收到的才是带实况效果的完整 Live Photo。</div>
-      </div>
       <div class="sel-bar" id="selBar" hidden>
         <span class="total-hint" id="totalHint"></span>
         <button class="link" id="btnClear">清空</button>
@@ -203,9 +197,7 @@ function clearSenderFiles() {
   S.liveVersion = (S.liveVersion || 0) + 1; // 使进行中的扫描失效
   S.liveSet = new Set();
   S.liveDetect = null;
-  S.unpairedLive = false;
   renderSenderFiles();
-  updateLiveBanner();
 }
 
 /* ---------- Live Photo 配对识别 ----------
@@ -253,9 +245,7 @@ function detectLivePairs() {
     await sleep(80); // 合并连续的文件添加
     if (v !== S.liveVersion || !S.files.length) {
       S.liveSet = new Set();
-      S.unpairedLive = false;
       renderSenderFiles();
-      updateLiveBanner();
       return;
     }
     const isStill = (f) => /\.(heic|heif|jpe?g|tiff?)$/i.test(f.name) || /^image\//.test(f.type);
@@ -284,20 +274,11 @@ function detectLivePairs() {
         }
       }
     }
-    // 识别"只选到 Live 静态部分"的情况（内嵌 ContentIdentifier 但没有配对的 MOV）
-    const unpaired = results.some((r) => r.isStill && !liveSet.has(r.i) && r.uuids.size > 0);
     if (v !== S.liveVersion) return;
     S.liveSet = liveSet;
-    S.unpairedLive = unpaired;
     renderSenderFiles();
-    updateLiveBanner();
   })();
   return S.liveDetect;
-}
-
-function updateLiveBanner() {
-  const b = $('#liveBanner');
-  if (b) b.hidden = !S.unpairedLive;
 }
 
 /* ---------- 方向/镜像归一化 ----------
