@@ -188,6 +188,10 @@ async function runThumbQueue(gen) {
       S.thumbUrls.push(url);
       tile.inner.innerHTML = `<video src="${url}" muted preload="metadata"></video>`;
       const v = tile.inner.querySelector('video');
+      // preload=metadata 只加载元数据不渲染画面；seek 到首帧附近让浏览器渲染海报帧
+      v.addEventListener('loadedmetadata', () => {
+        try { v.currentTime = Math.min(0.1, (v.duration || 0.2) / 2); } catch { /* noop */ }
+      }, { once: true });
       v.addEventListener('error', () => { if (gen === S.thumbGen) tile.inner.innerHTML = '🎬'; });
       continue;
     }

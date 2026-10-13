@@ -391,7 +391,12 @@ function finalizeFile(i) {
       t.inner.querySelector('img').addEventListener('error', () => { t.inner.innerHTML = '🖼️'; });
     } else if (kind === '视频') {
       t.inner.innerHTML = `<video src="${url}" muted preload="metadata"></video>`;
-      t.inner.querySelector('video').addEventListener('error', () => { t.inner.innerHTML = '🎬'; });
+      const v = t.inner.querySelector('video');
+      // preload=metadata 只加载元数据不渲染画面；seek 到首帧附近让浏览器渲染海报帧
+      v.addEventListener('loadedmetadata', () => {
+        try { v.currentTime = Math.min(0.1, (v.duration || 0.2) / 2); } catch { /* noop */ }
+      }, { once: true });
+      v.addEventListener('error', () => { t.inner.innerHTML = '🎬'; });
     } else {
       t.inner.innerHTML = fileIcon(st.meta.name, st.meta.mime);
     }
