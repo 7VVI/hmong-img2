@@ -1070,14 +1070,10 @@ function receiverOnCtl(msg) {
       maybeAllDone();
       break;
     case 'session-state': {
-      // 发送方会话已开始：本接收方无法加入本次传输，给出明确指引
+      // 发送方会话已开始：本接收方无法加入本次传输
       $('#rWait').hidden = true;
       $('#rMain').hidden = false;
-      if (msg.done) {
-        setReceiverStatus('err', '本批文件已完成传输。如需再次接收，请让发送方点「再传一批」后重新扫码');
-      } else {
-        setReceiverStatus('err', '传输正在进行中，无法加入。请等发送方完成后重新发起');
-      }
+      setReceiverStatus('err', '传输已终止');
       closeReceiverDataWs();
       break;
     }
