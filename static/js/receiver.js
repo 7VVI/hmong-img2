@@ -50,10 +50,6 @@ export function initReceiver() {
       </div>
     </section>
   `;
-  // 顶部栏右侧的快捷操作：有文件落地后可用
-  $('#heroActions').hidden = false;
-  $('#heroActions').innerHTML = `<button class="btn ghost sm" id="btnSaveAll" hidden>保存全部</button>`;
-  $('#btnSaveAll').addEventListener('click', saveAll);
 
   // 连接兜底：长时间既无文件清单也无任何推进时给出明确提示，避免一直转圈
   setTimeout(() => {
@@ -409,13 +405,8 @@ function finalizeFile(i) {
     }
   }
   autoDownload(st.meta, blob, R.items.length * 350);
-  $('#btnSaveAll').hidden = false;
   sendReceiverCtl({ t: 'received', i });
   maybeAllDone();
-}
-
-function saveAll() {
-  R.items.forEach((it, idx) => autoDownload(it.meta, it.blob, idx * 400));
 }
 
 function maybeAllDone() {
@@ -424,7 +415,6 @@ function maybeAllDone() {
   R.got = R.total;
   updateReceiverProgress(null, 100, true);
   setReceiverStatus('ok', '全部接收完成');
-  $('#btnSaveAll').hidden = false;
 }
 
 /* ---------- 对外状态（测试钩子/调试用） ---------- */
