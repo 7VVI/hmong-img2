@@ -116,7 +116,7 @@ function initSender() {
     <section class="card" id="pickCard">
       <!-- 发送面板：生成后置顶显示（二维码 + 状态进度），文件预览在下方 -->
       <div id="sendPanel" hidden>
-        <h2 class="panel-title">用接收方手机扫码</h2>
+        <h2 class="panel-title">快传扫码</h2>
         <div class="send-panel-col">
           <div class="qr-box-wrap">
             <div class="qr-box loading" id="qrBox">二维码生成中…</div>
@@ -129,7 +129,7 @@ function initSender() {
           <div class="send-info">
             <div class="status-line"><span class="dot" id="stDot"></span><span id="stText">等待接收方扫码…</span><span class="mode-badge" id="modeBadge" hidden></span></div>
             <div class="join-url">
-              <input id="joinUrl" spellcheck="false" title="接收方访问的地址，可改成局域网 IP 或公网域名">
+              <input id="joinUrl" spellcheck="false" title="接收方访问的地址">
               <button class="btn ghost" id="btnCopy">复制链接</button>
             </div>
             <div class="progress" id="prog" hidden><div class="fill" id="progFill"></div></div>
@@ -162,7 +162,7 @@ function initSender() {
   // 顶部栏右侧的操作按钮：开始发送后显示「新建传输」，完成后显示「再传一批」
   $('#heroActions').hidden = false;
   $('#heroActions').innerHTML = `
-    <button class="btn ghost sm" id="btnRestart" hidden>新建传输</button>
+    <button class="btn ghost sm" id="btnRestart" hidden>新建快传</button>
     <button class="btn ghost sm" id="btnReset" hidden>再传一批</button>
   `;
 
@@ -611,7 +611,7 @@ function senderOnCtl(msg) {
       }
       break;
     case 'peer-left':
-      if (!S.transfer.finished) setSenderStatus('', '接收方已断开，等待新的扫码…');
+      if (!S.transfer.finished) setSenderStatus('', '接收方已断开');
       break;
     case 'cancel':
       if (!S.transfer.finished) setSenderStatus('err', '接收方已取消');
@@ -656,7 +656,7 @@ function senderWebRTC() {
     };
     dc.onclose = () => {
       if (S.transfer.mode === 'p2p' && !S.transfer.finished) {
-        setSenderStatus('err', 'P2P 连接中断，请让接收方重新扫码');
+        setSenderStatus('err', 'P2P 连接中断');
         sendWsCtl({ t: 'cancel' });
         $('#btnReset').hidden = false;
       }
@@ -763,7 +763,7 @@ async function startPump(mode) {
   T.total = S.files.reduce((a, f) => a + f.size, 0);
   T.fileSent = new Array(S.files.length).fill(0);
   setModeBadge(mode);
-  setSenderStatus(mode === 'p2p' ? 'p2p' : '', mode === 'p2p' ? 'P2P 开始传输…' : '服务器开始传输…');
+  setSenderStatus(mode === 'p2p' ? 'p2p' : '', mode === 'p2p' ? 'P2P 开始传输' : '服务器开始传输');
   $('#prog').hidden = false;
   $('#progMeta').hidden = false;
   sendWsCtl({ t: 'meta', files: S.files.map((f) => fileMeta(f)) });
@@ -964,7 +964,7 @@ function initReceiver() {
   setTimeout(() => {
     if (!R.metas && !R.decided && !R.completeSeen) {
       $('#rWait').innerHTML = `<p style="font-size:34px;margin:8px 0">⏱️</p>
-        <p class="muted">连接超时，可能发送方已离开。<br>请让发送方重新生成二维码后再扫一次。</p>`;
+        <p class="muted">连接超时，可能发送方已离开。</p>`;
       closeReceiverDataWs();
     }
   }, 30000);
@@ -976,7 +976,7 @@ function initReceiver() {
     })
     .catch(() => {
       $('#rWait').innerHTML = `<p style="font-size:34px;margin:8px 0">🕳️</p>
-        <p class="muted">房间不存在或已过期，<br>请让发送方重新生成二维码后再扫一次。</p>`;
+        <p class="muted">房间不存在或已过期</p>`;
     });
 }
 
@@ -1091,7 +1091,7 @@ function receiverOnCtl(msg) {
       setReceiverStatus('err', '发送方已取消传输');
       break;
     case 'room-closed':
-      setReceiverStatus('err', '发送方已关闭，请重新扫码');
+      setReceiverStatus('err', '发送方已结束传输');
       closeReceiverDataWs();
       break;
   }
@@ -1133,7 +1133,7 @@ async function receiverWebRTC(offerSdp) {
         R.decided = true;
         R.mode = 'p2p';
         setModeBadge('p2p');
-        setReceiverStatus('p2p', 'P2P 开始接收…');
+        setReceiverStatus('p2p', 'P2P 开始接收');
         closeReceiverDataWs(); // P2P 可用，中转通道不再需要
       }
     };
@@ -1161,7 +1161,7 @@ function receiverRelayFallback() {
   R.mode = 'relay';
   if (R.pc) { try { R.pc.close(); } catch { /* noop */ } R.pc = null; R.dc = []; }
   setModeBadge('relay');
-  setReceiverStatus('', '服务器开始接收…');
+  setReceiverStatus('', '服务器开始接收');
   sendReceiverCtl({ t: 'relay-mode' }); // 通知发送方也切换到中转
   maybeSendReady();
 }
