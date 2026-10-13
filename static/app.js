@@ -801,6 +801,9 @@ async function startPump(mode) {
     $('#btnRestart').hidden = true;
     $('#btnReset').hidden = false;
     if ((T.doneCount || 0) >= S.files.length) {
+      // 全部文件已被接收保存：通知服务器记录任务完成，
+      // 之后的扫码直接提示传输已结束（一次任务只允许接收一次）
+      sendWsCtlDirect({ t: 'task-done' });
       setSenderStatus('ok', '全部传输完成');
     } else {
       setSenderStatus('err', '部分文件未确认保存完成，请勿关闭本页');
@@ -920,6 +923,7 @@ function initReceiver() {
     dc: [],            // P2P DataChannel（按槽位）
     dcOpen: 0,
     metas: null,
+    sessionEnded: false, // 已收到会话结束提示（任务完成/无法加入），不再重连
     pending: new Map(), // i -> {meta, parts: [][SLOTS], got}
     finalized: new Set(),
     mode: null,
@@ -994,6 +998,11 @@ function openReceiverWs() {
     if (typeof ev.data === 'string') receiverOnCtl(JSON.parse(ev.data));
   };
   ws.onclose = () => {
+    // 会话已结束提示已展示（任务完成或无法加入），被后续扫码顶替属预期，无需动作
+    if (R.sessionEnded) return;
+    // 任务已完整接收：停留在完成界面，不重连（重连会顶掉新扫码的接收方）
+    const taskDone = R.completeSeen && R.metas && R.received >= R.metas.length;
+    if (taskDone) return;
     // P2P 模式数据走 DataChannel，控制通道断开不致命，自动重连
     if (R.decided && R.mode === 'p2p') {
       if ((R.wsAttempts || 0) < 12) {
@@ -1003,7 +1012,7 @@ function openReceiverWs() {
       }
       return;
     }
-    if (!R.completeSeen || R.received < R.metas.length) {
+    if (!R.completeSeen || !R.metas || R.received < R.metas.length) {
       setReceiverStatus('err', '与服务器的连接已断开，请刷新重试');
     }
   };
@@ -1071,9 +1080,10 @@ function receiverOnCtl(msg) {
       break;
     case 'session-state': {
       // 发送方会话已开始：本接收方无法加入本次传输
+      R.sessionEnded = true;
       $('#rWait').hidden = true;
       $('#rMain').hidden = false;
-      setReceiverStatus('err', '传输已终止');
+      setReceiverStatus('err', msg.done ? '传输已结束' : '传输已终止');
       closeReceiverDataWs();
       break;
     }

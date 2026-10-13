@@ -94,19 +94,27 @@ async fn handle_ctl_socket(socket: WebSocket, params: WsParams, state: Arc<AppSt
             let _ = sink.send(Message::Close(None)).await;
             return;
         }
-        Some((replaced, meta)) => {
-            if let Some(old) = replaced {
+        Some(reg) => {
+            if let Some(old) = reg.replaced_tx {
                 let _ = old.send(Message::Close(None));
             }
             if !is_sender {
-                if let Some(meta) = meta {
-                    let _ = tx.send(Message::Text(meta.to_string().into()));
+                if reg.done {
+                    // 任务已被接收过：一次任务只允许接收一次，直接提示结束
+                    let _ = tx.send(
+                        Message::Text(json!({"t":"session-state","done":true}).to_string().into()),
+                    );
+                    tracing::info!("接收方加入已完成房间 {room_id}，已提示传输结束");
+                } else {
+                    if let Some(meta) = reg.meta {
+                        let _ = tx.send(Message::Text(meta.to_string().into()));
+                    }
+                    if let Some(sender) = state.rooms.peer_ctl_tx(&room_id, false) {
+                        let _ = sender
+                            .send(Message::Text(json!({"t":"peer-joined"}).to_string().into()));
+                    }
+                    tracing::info!("接收方加入房间 {room_id}");
                 }
-                if let Some(sender) = state.rooms.peer_ctl_tx(&room_id, false) {
-                    let _ =
-                        sender.send(Message::Text(json!({"t":"peer-joined"}).to_string().into()));
-                }
-                tracing::info!("接收方加入房间 {room_id}");
             }
         }
     }
@@ -178,6 +186,11 @@ async fn handle_ctl_socket(socket: WebSocket, params: WsParams, state: Arc<AppSt
 
 fn on_ctl(state: &AppState, room_id: &str, from_sender: bool, v: &Value, text: &str) {
     let t = v.get("t").and_then(Value::as_str).unwrap_or("");
+    // 发送方确认任务已被完整接收：服务器记录状态，供后续扫码直接判定
+    if t == "task-done" && from_sender {
+        state.rooms.mark_done(room_id);
+        return;
+    }
     if !RELAYED_TYPES.contains(&t) {
         return;
     }

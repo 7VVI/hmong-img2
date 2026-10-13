@@ -33,6 +33,8 @@ struct Room {
     receiver_data: HashMap<u16, DataTx>,
     /// 发送方最后一次广播的文件清单，接收方（含断线重连）加入时补发。
     meta: Option<Value>,
+    /// 任务已被完整接收一次：之后的扫码直接提示传输已结束，不再下发文件。
+    done: bool,
     last_active: Instant,
 }
 
@@ -44,15 +46,19 @@ impl Room {
             receiver_ctl: None,
             receiver_data: HashMap::new(),
             meta: None,
+            done: false,
             last_active: Instant::now(),
         }
     }
 }
 
-/// 接收方控制连接登记结果：被顶替的旧连接与房间缓存的文件清单。
-pub struct ReceiverJoin {
+/// 控制连接登记结果。
+pub struct CtlRegister {
     pub replaced_tx: Option<ClientTx>,
+    /// 接收方加入时补发的文件清单（任务已结束时为 None）。
     pub meta: Option<Value>,
+    /// 任务已完成（接收方扫码应直接收到结束提示）。
+    pub done: bool,
 }
 
 pub enum UnregisterOutcome {
@@ -113,13 +119,8 @@ impl RoomRegistry {
         })
     }
 
-    /// 控制连接登记：发送方不存在则补建房间；返回被顶替的旧连接。
-    pub fn register_ctl(
-        &self,
-        id: &str,
-        is_sender: bool,
-        tx: ClientTx,
-    ) -> Option<(Option<ClientTx>, Option<Value>)> {
+    /// 控制连接登记：发送方不存在则补建房间；返回被顶替的旧连接与房间状态。
+    pub fn register_ctl(&self, id: &str, is_sender: bool, tx: ClientTx) -> Option<CtlRegister> {
         let mut rooms = self.0.lock().unwrap();
         let room = rooms.entry(id.to_string()).or_insert_with(Room::new);
         room.last_active = Instant::now();
@@ -128,9 +129,30 @@ impl RoomRegistry {
         } else {
             &mut room.receiver_ctl
         };
-        let old = slot.replace(tx);
-        let meta = if is_sender { None } else { room.meta.clone() };
-        Some((old, meta))
+        let replaced_tx = slot.replace(tx);
+        let (meta, done) = if is_sender {
+            (None, false)
+        } else {
+            // 任务已结束后不再下发文件清单，扫码方直接收到结束提示
+            if room.done {
+                (None, true)
+            } else {
+                (room.meta.clone(), false)
+            }
+        };
+        Some(CtlRegister {
+            replaced_tx,
+            meta,
+            done,
+        })
+    }
+
+    /// 标记任务已被完整接收一次；之后的扫码直接提示传输已结束。
+    pub fn mark_done(&self, id: &str) {
+        if let Some(room) = self.0.lock().unwrap().get_mut(id) {
+            room.last_active = Instant::now();
+            room.done = true;
+        }
     }
 
     /// 数据槽位登记：房间不存在返回 false。
