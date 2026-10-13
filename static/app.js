@@ -508,14 +508,33 @@ function openSenderWs() {
   S.ws = ws;
   ws.onopen = () => {
     S.closing = false;
+    S.wsAttempts = 0;
     sendWsCtl({ t: 'meta', files: S.files.map((f) => fileMeta(f)) });
-    setSenderStatus('', '等待接收方扫码…');
+    if (S.transfer.started && S.transfer.mode === 'p2p' && !S.transfer.finished) {
+      // P2P 传输中控制通道重连成功，数据通道不受影响
+      setSenderStatus('p2p', 'P2P 传输中（控制通道已恢复）…');
+    } else if (!S.transfer.started) {
+      setSenderStatus('', '等待接收方扫码…');
+    }
   };
   ws.onmessage = (ev) => {
     if (typeof ev.data === 'string') senderOnCtl(JSON.parse(ev.data));
   };
   ws.onclose = () => {
-    if (!S.closing && !S.transfer.finished) setSenderStatus('err', '与服务器的连接已断开，请刷新页面重试');
+    if (S.closing) return;
+    const p2pActive = S.transfer.started && S.transfer.mode === 'p2p' && !S.transfer.finished;
+    if (!p2pActive) {
+      if (!S.transfer.finished) setSenderStatus('err', '与服务器的连接已断开，请刷新页面重试');
+      return;
+    }
+    // P2P 传输中：数据走 DataChannel 不受影响，静默重连控制通道
+    if ((S.wsAttempts || 0) < 12 && !S.transfer.finished) {
+      S.wsAttempts = (S.wsAttempts || 0) + 1;
+      setSenderStatus('p2p', 'P2P 传输中（控制通道重连中）…');
+      setTimeout(() => {
+        if (!S.closing && !S.transfer.finished && (!S.ws || S.ws.readyState > 1)) openSenderWs();
+      }, 2000);
+    }
   };
 }
 
@@ -524,12 +543,21 @@ function fileMeta(f) {
 }
 
 function sendWsCtl(obj) {
-  if (S.ws && S.ws.readyState === 1) S.ws.send(JSON.stringify(obj));
+  const s = JSON.stringify(obj);
+  if (S.ws && S.ws.readyState === 1) { S.ws.send(s); return; }
+  // 控制通道断开时 P2P 传输经 DataChannel 旁路发送
+  if (S.transfer.mode === 'p2p') {
+    const dc = S.dc.find((d) => d && d.readyState === 'open');
+    if (dc) { dc.send(s); return; }
+  }
 }
 
 function senderOnCtl(msg) {
   switch (msg.t) {
     case 'peer-joined':
+      // 传输开始后（含已完成）控制通道重连会触发重复通知，忽略——
+      // 数据通道仍工作，重新协商只会破坏现有连接
+      if (S.transfer.started) break;
       senderResetRound();
       setSenderStatus('', '接收方已连接，正在尝试 P2P 直连…');
       senderWebRTC();
@@ -611,6 +639,10 @@ function senderWebRTC() {
     dc.onopen = () => {
       S.dcOpen++;
       if (S.dcOpen === SLOTS && !S.transfer.started && S.transfer.mode !== 'relay') startPump('p2p');
+    };
+    dc.onmessage = (ev) => {
+      // 控制通道断开时，接收方回执经 DataChannel 旁路到达
+      if (typeof ev.data === 'string') senderOnCtl(JSON.parse(ev.data));
     };
     dc.onclose = () => {
       if (S.transfer.mode === 'p2p' && !S.transfer.finished) {
@@ -930,13 +962,28 @@ function openReceiverWs() {
   ws.binaryType = 'arraybuffer';
   R.ws = ws;
   ws.onopen = () => {
-    setReceiverStatus('', '已连接，等待发送方…');
-    openReceiverDataWs();
+    R.wsAttempts = 0;
+    if (R.decided && R.mode === 'p2p') {
+      setReceiverStatus('p2p', 'P2P 接收中（控制通道已恢复）…');
+    } else {
+      setReceiverStatus('', '已连接，等待发送方…');
+    }
+    // 数据槽位只在首次（决策前）预建，P2P 重连不需要也不该重复注册
+    if (!R.decided) openReceiverDataWs();
   };
   ws.onmessage = (ev) => {
     if (typeof ev.data === 'string') receiverOnCtl(JSON.parse(ev.data));
   };
   ws.onclose = () => {
+    // P2P 模式数据走 DataChannel，控制通道断开不致命，自动重连
+    if (R.decided && R.mode === 'p2p') {
+      if ((R.wsAttempts || 0) < 12) {
+        R.wsAttempts = (R.wsAttempts || 0) + 1;
+        setReceiverStatus('p2p', 'P2P 接收中（控制通道重连中）…');
+        setTimeout(() => { if (!R.ws || R.ws.readyState > 1) openReceiverWs(); }, 2000);
+      }
+      return;
+    }
     if (!R.completeSeen || R.received < R.metas.length) {
       setReceiverStatus('err', '与服务器的连接已断开，请刷新重试');
     }
@@ -975,6 +1022,7 @@ function receiverOnCtl(msg) {
       break;
     case 'sdp':
       if (msg.type === 'offer') {
+        if (R.decided) break; // 已决策通道后忽略迟到的协商请求
         if (FORCE_RELAY || R.mode === 'relay') {
           receiverRelayFallback();
         } else {
@@ -1088,7 +1136,13 @@ function closeReceiverDataWs() {
 }
 
 function sendReceiverCtl(obj) {
-  if (R.ws && R.ws.readyState === 1) R.ws.send(JSON.stringify(obj));
+  const s = JSON.stringify(obj);
+  // P2P 模式优先走 DataChannel：控制通道断开时回执依然可达
+  if (R.mode === 'p2p') {
+    const dc = R.dc.find((d) => d && d.readyState === 'open');
+    if (dc) { dc.send(s); return; }
+  }
+  if (R.ws && R.ws.readyState === 1) R.ws.send(s);
 }
 
 function renderReceiverFiles(files) {
@@ -1222,10 +1276,25 @@ function finalizeFile(i) {
   maybeAllDone();
 }
 
+/* 下载文件名：微信等来源的文件常没有扩展名，系统无法识别类型入库
+ * （视频没扩展名就不会进相册），按 MIME 自动补全 */
+const MIME_EXT = {
+  'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp',
+  'image/heic': '.heic', 'image/heif': '.heif', 'image/bmp': '.bmp',
+  'video/mp4': '.mp4', 'video/quicktime': '.mov', 'video/webm': '.webm', 'video/x-m4v': '.m4v',
+};
+
+function downloadName(meta) {
+  const name = (meta.name || 'file').trim() || 'file';
+  if (/\.[a-z0-9]{2,5}$/i.test(name)) return name;
+  const ext = MIME_EXT[(meta.mime || '').toLowerCase()] || '.bin';
+  return name + ext;
+}
+
 function saveOne(meta, url, btn) {
   const a = document.createElement('a');
   a.href = url;
-  a.download = meta.name;
+  a.download = downloadName(meta);
   a.rel = 'noopener';
   document.body.appendChild(a);
   a.click();
@@ -1241,7 +1310,7 @@ function autoDownload(meta, url, delay) {
   setTimeout(() => {
     const a = document.createElement('a');
     a.href = url;
-    a.download = meta.name;
+    a.download = downloadName(meta);
     a.rel = 'noopener';
     document.body.appendChild(a);
     a.click();
