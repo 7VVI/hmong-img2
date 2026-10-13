@@ -144,10 +144,20 @@ Live Photo 实际是「HEIC/JPEG 静态图 + MOV 视频」一对文件，靠 App
 ```
 ├── Cargo.toml          # Rust 依赖（axum + tokio + qrcode + rust-embed + hmac）
 ├── Dockerfile          # 多阶段构建：编译 → debian-slim 运行镜像
-├── static/             # 前端（编译期内嵌进二进制）
+├── static/             # 前端（编译期内嵌进二进制，原生 ES 模块）
 │   ├── index.html      # 单页骨架（发送方/接收方共用，按 ?r= 参数分流）
 │   ├── style.css       # 浅色主题样式
-│   └── app.js          # 核心逻辑：密钥门禁、文件选择、二维码、WebRTC 协商、传输泵、回退、自动接收
+│   └── js/
+│       ├── app.js        # 入口：骨架渲染、密钥门禁分流、测试钩子
+│       ├── config.js     # 常量与协议参数（槽位数、分片、背压阈值、wsUrl）
+│       ├── util.js       # DOM/格式化/类型判断等纯工具
+│       ├── shell.js      # 页面骨架（顶栏 + 主区域）
+│       ├── auth-gate.js  # 发送方密钥门禁（校验/令牌/输入界面）
+│       ├── preview.js    # 原图预览灯箱（收发共用）
+│       ├── normalize.js  # 方向/镜像归一化（EXIF 解析 + 像素烘焙）
+│       ├── download.js   # 下载落盘（扩展名补全 + octet-stream 防内联）
+│       ├── sender.js     # 发送方：选择/缩略图队列/协商/并行传输泵
+│       └── receiver.js   # 接收方：连接/协商/并行重组/完成落盘
 └── src/
     ├── main.rs         # 入口：日志/状态初始化、路由装配、监听（薄壳）
     ├── config.rs       # 配置：PORT / KEY / ROOM_TTL / MAX_ROOMS，集中从环境变量解析
