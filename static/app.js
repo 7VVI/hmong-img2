@@ -1096,7 +1096,7 @@ async function receiverWebRTC(offerSdp) {
         R.decided = true;
         R.mode = 'p2p';
         setModeBadge('p2p');
-        setReceiverStatus('p2p', 'P2P 直连已建立，自动接收中…');
+        setReceiverStatus('p2p', 'P2P 开始接收…');
         closeReceiverDataWs(); // P2P 可用，中转通道不再需要
       }
     };
@@ -1124,7 +1124,7 @@ function receiverRelayFallback() {
   R.mode = 'relay';
   if (R.pc) { try { R.pc.close(); } catch { /* noop */ } R.pc = null; R.dc = []; }
   setModeBadge('relay');
-  setReceiverStatus('', '无法 P2P 直连，已切换服务器中转…');
+  setReceiverStatus('', '服务器开始接收…');
   sendReceiverCtl({ t: 'relay-mode' }); // 通知发送方也切换到中转
   maybeSendReady();
 }
