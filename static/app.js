@@ -753,7 +753,7 @@ async function startPump(mode) {
   T.total = S.files.reduce((a, f) => a + f.size, 0);
   T.fileSent = new Array(S.files.length).fill(0);
   setModeBadge(mode);
-  setSenderStatus(mode === 'p2p' ? 'p2p' : '', mode === 'p2p' ? 'P2P 直连已建立，开始传输…' : '已切换服务器中转，开始传输…');
+  setSenderStatus(mode === 'p2p' ? 'p2p' : '', mode === 'p2p' ? 'P2P 开始传输…' : '服务器开始传输…');
   $('#prog').hidden = false;
   $('#progMeta').hidden = false;
   sendWsCtl({ t: 'meta', files: S.files.map((f) => fileMeta(f)) });
