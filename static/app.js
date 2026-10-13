@@ -106,7 +106,7 @@ function initSender() {
     thumbUrls: [],
     thumbGen: 0,       // 缩略图队列版本号，列表变化即递增
     gen: 0,            // 传输代数，接收方重连时自增以中止旧循环
-    transfer: { started: false, mode: null, finished: false, sent: 0, total: 0, fileSent: [] },
+    transfer: { started: false, mode: null, finished: false, sent: 0, total: 0, fileSent: [], doneCount: 0 },
     lastUi: 0,
     lastBytes: 0,
     lastTime: 0,
@@ -583,7 +583,7 @@ function senderOnCtl(msg) {
 
 function senderResetRound() {
   S.gen++;
-  S.transfer = { started: false, mode: null, finished: false, sent: 0, total: 0, fileSent: [] };
+  S.transfer = { started: false, mode: null, finished: false, sent: 0, total: 0, fileSent: [], doneCount: 0 };
   S.lastBytes = 0; S.lastTime = 0;
   S.tiles.forEach((t) => {
     t.wrap.className = 'thumbwrap';
@@ -743,13 +743,26 @@ async function startPump(mode) {
       }
     }
     sendWsCtl({ t: 'complete' });
-    T.finished = true;
     T.sent = T.total;
     $('#progFill').style.width = '100%';
     $('#progBytes').textContent = `${fmtBytes(T.total)} / ${fmtBytes(T.total)}`;
+    // 端到端完成门控：等接收方逐文件保存回执后再提示完成。
+    // 中转模式下服务器转发可能远慢于发送方出字节的速率（背压只保证不丢，
+    // 不保证已送达），此时若发送方提前关页会销毁房间、掐断接收方。
+    const deadline = Date.now() + 300000;
+    while ((T.doneCount || 0) < S.files.length && Date.now() < deadline && T.gen === S.gen) {
+      setSenderStatus('', `等待接收方保存完成 (${Math.min(T.doneCount || 0, S.files.length)}/${S.files.length})…`);
+      await sleep(500);
+    }
+    if (T.gen !== S.gen) return;
+    T.finished = true;
     $('#btnRestart').hidden = true;
     $('#btnReset').hidden = false;
-    setSenderStatus('ok', '全部传输完成');
+    if ((T.doneCount || 0) >= S.files.length) {
+      setSenderStatus('ok', '全部传输完成');
+    } else {
+      setSenderStatus('err', '部分文件未确认保存完成，请勿关闭本页');
+    }
   } catch (e) {
     if (T.gen === S.gen) {
       setSenderStatus('err', '传输出错：' + (e && e.message ? e.message : '连接已断开'));

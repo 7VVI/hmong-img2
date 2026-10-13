@@ -30,6 +30,10 @@ use tokio::sync::mpsc;
 use crate::rooms::UnregisterOutcome as Unregister;
 use crate::state::AppState;
 
+/// 数据槽位出站队列容量（帧）。接收方消费慢时队列填满、转发阻塞，
+/// 背压逐层传回发送方，保证服务器内存不因慢速接收方而膨胀。
+const DATA_QUEUE_FRAMES: usize = 128;
+
 /// 需要在收发双方之间转发的控制消息类型。
 const RELAYED_TYPES: &[&str] = &[
     "sdp", "ice", "meta", "relay-mode", "ready", "file-start", "file-end", "complete", "cancel",
@@ -146,8 +150,8 @@ async fn handle_ctl_socket(socket: WebSocket, params: WsParams, state: Arc<AppSt
             receiver_ctl,
             close_list,
         } => {
-            for tx in close_list {
-                let _ = tx.send(Message::Close(None));
+            for data_tx in close_list {
+                let _ = data_tx.send(Message::Close(None)).await;
             }
             if let Some(receiver) = receiver_ctl {
                 let _ =
@@ -160,8 +164,8 @@ async fn handle_ctl_socket(socket: WebSocket, params: WsParams, state: Arc<AppSt
             sender_ctl,
             close_list,
         } => {
-            for tx in close_list {
-                let _ = tx.send(Message::Close(None));
+            for data_tx in close_list {
+                let _ = data_tx.send(Message::Close(None)).await;
             }
             if let Some(sender) = sender_ctl {
                 let _ = sender.send(Message::Text(json!({"t":"peer-left"}).to_string().into()));
@@ -192,7 +196,8 @@ async fn handle_data_socket(socket: WebSocket, params: WsParams, state: Arc<AppS
     let slot = params.slot.unwrap_or(0);
 
     let (mut sink, mut stream) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    // 有界队列：对端消费慢时 send 阻塞 → 不再读本端 socket → TCP 背压回传给发送方
+    let (tx, mut rx) = mpsc::channel::<Message>(DATA_QUEUE_FRAMES);
 
     if !state.rooms.register_data(&room_id, is_sender, slot, tx.clone()) {
         tracing::debug!("数据槽位 {slot} 加入不存在的房间 {room_id}，拒绝");
@@ -219,8 +224,14 @@ async fn handle_data_socket(socket: WebSocket, params: WsParams, state: Arc<AppS
             next = stream.next() => {
                 match next {
                     Some(Ok(Message::Binary(data))) => {
+                        // 阻塞式转发：对端慢则在此等待，暂停读取发送方数据形成背压
+                        let mut delivered = false;
                         if let Some(peer) = state.rooms.peer_data_tx(&room_id, is_sender, slot) {
-                            let _ = peer.send(Message::Binary(data));
+                            delivered = peer.send(Message::Binary(data)).await.is_ok();
+                        }
+                        if !delivered {
+                            tracing::debug!("槽位 {slot} 对端不可达，停止转发（房间 {room_id}）");
+                            break;
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,

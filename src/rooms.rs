@@ -20,7 +20,7 @@ use axum::{
 use rand::Rng;
 use serde_json::{json, Value};
 
-use crate::state::{AppState, ClientTx};
+use crate::state::{AppState, ClientTx, DataTx};
 
 /// 数据槽位数量：并行传输的通道数（收发双方各开同数量连接）。
 pub const SLOTS: u16 = 3;
@@ -28,9 +28,9 @@ pub const SLOTS: u16 = 3;
 /// 房间内连接的登记信息。
 struct Room {
     sender_ctl: Option<ClientTx>,
-    sender_data: HashMap<u16, ClientTx>,
+    sender_data: HashMap<u16, DataTx>,
     receiver_ctl: Option<ClientTx>,
-    receiver_data: HashMap<u16, ClientTx>,
+    receiver_data: HashMap<u16, DataTx>,
     /// 发送方最后一次广播的文件清单，接收方（含断线重连）加入时补发。
     meta: Option<Value>,
     last_active: Instant,
@@ -60,12 +60,12 @@ pub enum UnregisterOutcome {
     /// `receiver_ctl` 需要收到关闭通知；`close_list` 为所有数据槽位（需发送 Close）。
     SenderRemoved {
         receiver_ctl: Option<ClientTx>,
-        close_list: Vec<ClientTx>,
+        close_list: Vec<DataTx>,
     },
     /// 接收方控制连接注销：`sender_ctl` 需要收到通知；`close_list` 为接收方数据槽位。
     ReceiverRemoved {
         sender_ctl: Option<ClientTx>,
-        close_list: Vec<ClientTx>,
+        close_list: Vec<DataTx>,
     },
     /// 槽位已被顶替或房间不存在，无需处理。
     NotOwner,
@@ -134,7 +134,7 @@ impl RoomRegistry {
     }
 
     /// 数据槽位登记：房间不存在返回 false。
-    pub fn register_data(&self, id: &str, is_sender: bool, slot: u16, tx: ClientTx) -> bool {
+    pub fn register_data(&self, id: &str, is_sender: bool, slot: u16, tx: DataTx) -> bool {
         let mut rooms = self.0.lock().unwrap();
         let Some(room) = rooms.get_mut(id) else {
             return false;
@@ -168,7 +168,7 @@ impl RoomRegistry {
     }
 
     /// 取对端同号数据槽位并顺带续活；对端未上线时返回 None（帧丢弃）。
-    pub fn peer_data_tx(&self, id: &str, from_sender: bool, slot: u16) -> Option<ClientTx> {
+    pub fn peer_data_tx(&self, id: &str, from_sender: bool, slot: u16) -> Option<DataTx> {
         let mut rooms = self.0.lock().unwrap();
         let room = rooms.get_mut(id)?;
         room.last_active = Instant::now();
@@ -196,7 +196,7 @@ impl RoomRegistry {
         let mine =
             |slot: &Option<ClientTx>| slot.as_ref().map(|t| t.same_channel(tx)).unwrap_or(false);
         if is_sender && mine(&room.sender_ctl) {
-            let mut close_list: Vec<ClientTx> = room.sender_data.values().cloned().collect();
+            let mut close_list: Vec<DataTx> = room.sender_data.values().cloned().collect();
             close_list.extend(room.receiver_data.values().cloned());
             let receiver_ctl = room.receiver_ctl.clone();
             rooms.remove(id);
@@ -206,7 +206,7 @@ impl RoomRegistry {
             }
         } else if !is_sender && mine(&room.receiver_ctl) {
             room.receiver_ctl = None;
-            let close_list: Vec<ClientTx> = room.receiver_data.values().cloned().collect();
+            let close_list: Vec<DataTx> = room.receiver_data.values().cloned().collect();
             room.receiver_data.clear();
             UnregisterOutcome::ReceiverRemoved {
                 sender_ctl: room.sender_ctl.clone(),
@@ -218,7 +218,7 @@ impl RoomRegistry {
     }
 
     /// 注销数据槽位（连接断开时自清理）。
-    pub fn unregister_data(&self, id: &str, is_sender: bool, slot: u16, tx: &ClientTx) {
+    pub fn unregister_data(&self, id: &str, is_sender: bool, slot: u16, tx: &DataTx) {
         let mut rooms = self.0.lock().unwrap();
         let Some(room) = rooms.get_mut(id) else {
             return;
