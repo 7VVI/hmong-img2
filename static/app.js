@@ -1001,8 +1001,7 @@ function openReceiverWs() {
     // 会话已结束提示已展示（任务完成或无法加入），被后续扫码顶替属预期，无需动作
     if (R.sessionEnded) return;
     // 任务已完整接收：停留在完成界面，不重连（重连会顶掉新扫码的接收方）
-    const taskDone = R.completeSeen && R.metas && R.received >= R.metas.length;
-    if (taskDone) return;
+    if (isTaskDone()) return;
     // P2P 模式数据走 DataChannel，控制通道断开不致命，自动重连
     if (R.decided && R.mode === 'p2p') {
       if ((R.wsAttempts || 0) < 12) {
@@ -1088,13 +1087,21 @@ function receiverOnCtl(msg) {
       break;
     }
     case 'cancel':
+      // 任务已完整接收后，发送方后续动作（关页/再传一批）不影响完成状态
+      if (isTaskDone() || R.sessionEnded) break;
       setReceiverStatus('err', '发送方已取消传输');
       break;
     case 'room-closed':
+      if (isTaskDone() || R.sessionEnded) { closeReceiverDataWs(); break; }
       setReceiverStatus('err', '发送方已结束传输');
       closeReceiverDataWs();
       break;
   }
+}
+
+// 任务是否已被本接收方完整接收（完成后状态不再受发送方动作影响）
+function isTaskDone() {
+  return !!(R.completeSeen && R.metas && R.received >= R.metas.length);
 }
 
 function ensurePending(i, meta) {
