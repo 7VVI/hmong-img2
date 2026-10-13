@@ -552,12 +552,22 @@ function sendWsCtl(obj) {
   }
 }
 
+// 直走服务器控制通道（不经 DataChannel 旁路）：
+// 旁路只通往当前活跃接收方，发给新扫码接收方的消息必须经服务器转达
+function sendWsCtlDirect(obj) {
+  if (S.ws && S.ws.readyState === 1) S.ws.send(JSON.stringify(obj));
+}
+
 function senderOnCtl(msg) {
   switch (msg.t) {
     case 'peer-joined':
-      // 传输开始后（含已完成）控制通道重连会触发重复通知，忽略——
+      // 传输开始后（进行中或已完成）控制通道重连会触发重复通知，忽略——
       // 数据通道仍工作，重新协商只会破坏现有连接
-      if (S.transfer.started) break;
+      if (S.transfer.started) {
+        // 但若是新接收方扫码（旧的已被服务器顶替），回复会话状态让其得到明确提示
+        sendWsCtlDirect({ t: 'session-state', done: !!S.transfer.finished });
+        break;
+      }
       senderResetRound();
       setSenderStatus('', '接收方已连接，正在尝试 P2P 直连…');
       senderWebRTC();
@@ -946,6 +956,15 @@ function initReceiver() {
   $('#heroActions').innerHTML = `<button class="btn ghost sm" id="btnSaveAll" hidden>保存全部</button>`;
   $('#btnSaveAll').addEventListener('click', saveAll);
 
+  // 连接兜底：长时间既无文件清单也无任何推进时给出明确提示，避免一直转圈
+  setTimeout(() => {
+    if (!R.metas && !R.decided && !R.completeSeen) {
+      $('#rWait').innerHTML = `<p style="font-size:34px;margin:8px 0">⏱️</p>
+        <p class="muted">连接超时，可能发送方已离开。<br>请让发送方重新生成二维码后再扫一次。</p>`;
+      closeReceiverDataWs();
+    }
+  }, 30000);
+
   fetch('/api/rooms/' + encodeURIComponent(ROOM))
     .then((res) => {
       if (!res.ok) throw new Error('gone');
@@ -1050,6 +1069,18 @@ function receiverOnCtl(msg) {
       R.completeSeen = true;
       maybeAllDone();
       break;
+    case 'session-state': {
+      // 发送方会话已开始：本接收方无法加入本次传输，给出明确指引
+      $('#rWait').hidden = true;
+      $('#rMain').hidden = false;
+      if (msg.done) {
+        setReceiverStatus('err', '本批文件已完成传输。如需再次接收，请让发送方点「再传一批」后重新扫码');
+      } else {
+        setReceiverStatus('err', '传输正在进行中，无法加入。请等发送方完成后重新发起');
+      }
+      closeReceiverDataWs();
+      break;
+    }
     case 'cancel':
       setReceiverStatus('err', '发送方已取消传输');
       break;

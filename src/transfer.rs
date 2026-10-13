@@ -37,7 +37,7 @@ const DATA_QUEUE_FRAMES: usize = 128;
 /// 需要在收发双方之间转发的控制消息类型。
 const RELAYED_TYPES: &[&str] = &[
     "sdp", "ice", "meta", "relay-mode", "ready", "file-start", "file-end", "complete", "cancel",
-    "received", "error",
+    "received", "session-state", "error",
 ];
 
 pub fn router() -> Router<Arc<AppState>> {
