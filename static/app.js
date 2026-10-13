@@ -1274,9 +1274,9 @@ function finalizeFile(i) {
   st.parts = null;
   R.pending.delete(i);
   const url = URL.createObjectURL(blob);
-  R.items.push({ meta: st.meta, url });
+  R.items.push({ meta: st.meta, url, blob });
   R.received++;
-  // 缩略图：填充真实预览，绿色完成环 + 打勾，点击可预览，右下角可单独保存
+  // 缩略图：填充真实预览，绿色完成环 + 打勾，点击可预览
   const t = R.tiles && R.tiles[i];
   if (t && !t.filled) {
     t.filled = true;
@@ -1299,15 +1299,8 @@ function finalizeFile(i) {
       t.inner.classList.add('zoomable');
       t.inner.addEventListener('click', () => openPreview(blob, st.meta.name, st.meta.size));
     }
-    const saveBtn = h(`<button class="tile-save" title="单独保存 ${st.meta.name}">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/>
-      </svg>
-    </button>`);
-    saveBtn.addEventListener('click', () => saveOne(st.meta, url, saveBtn));
-    t.wrap.appendChild(saveBtn);
   }
-  autoDownload(st.meta, url, R.items.length * 350);
+  autoDownload(st.meta, blob, R.items.length * 350);
   $('#btnSaveAll').hidden = false;
   sendReceiverCtl({ t: 'received', i });
   maybeAllDone();
@@ -1328,7 +1321,12 @@ function downloadName(meta) {
   return name + ext;
 }
 
-function saveOne(meta, url, btn) {
+/* 触发下载。用 slice 零拷贝把 MIME 改写为 application/octet-stream：
+ * 浏览器（尤其移动端微信/X5 内核）对 video/* 会接管成"边看边下载"式的
+ * 内联播放下载，传输结束后页面状态变化即中断；通用文件类型则直接落盘。 */
+function triggerDownload(meta, blob) {
+  const dl = blob.slice(0, blob.size, 'application/octet-stream');
+  const url = URL.createObjectURL(dl);
   const a = document.createElement('a');
   a.href = url;
   a.download = downloadName(meta);
@@ -1336,27 +1334,14 @@ function saveOne(meta, url, btn) {
   document.body.appendChild(a);
   a.click();
   a.remove();
-  if (btn) {
-    btn.classList.add('saved');
-    btn.title = '已保存';
-    setTimeout(() => btn.classList.remove('saved'), 1500);
-  }
 }
 
-function autoDownload(meta, url, delay) {
-  setTimeout(() => {
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = downloadName(meta);
-    a.rel = 'noopener';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-  }, delay || 0);
+function autoDownload(meta, blob, delay) {
+  setTimeout(() => triggerDownload(meta, blob), delay || 0);
 }
 
 function saveAll() {
-  R.items.forEach((it, idx) => autoDownload(it.meta, it.url, idx * 400));
+  R.items.forEach((it, idx) => autoDownload(it.meta, it.blob, idx * 400));
 }
 
 function maybeAllDone() {

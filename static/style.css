@@ -317,30 +317,6 @@ body {
 
 .check[hidden] { display: none; }
 
-/* 缩略图右下角的单独保存按钮（接收方） */
-.tile-save {
-  position: absolute;
-  right: 6px;
-  bottom: 6px;
-  z-index: 2;
-  width: 26px;
-  height: 26px;
-  border-radius: 50%;
-  border: none;
-  background: rgba(255, 255, 255, 0.88);
-  color: var(--accent);
-  display: grid;
-  place-items: center;
-  cursor: pointer;
-  backdrop-filter: blur(4px);
-  transition: background 0.15s, transform 0.1s, color 0.15s;
-}
-
-.tile-save:hover { background: #fff; transform: scale(1.08); }
-.tile-save:active { transform: scale(0.96); }
-.tile-save svg { width: 14px; height: 14px; }
-.tile-save.saved { color: var(--ok); }
-
 .fname {
   max-width: 104px;
   font-size: 12px;
