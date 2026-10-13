@@ -456,11 +456,18 @@ body {
 
 .panel-title { margin: 0 0 14px; font-size: 15px; font-weight: 600; }
 
-.qr-row { display: flex; gap: 22px; align-items: flex-start; flex-wrap: wrap; }
+/* 发送面板：二维码居中在上，状态/地址/进度在下方纵向排列 */
+.send-panel-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
+
+.send-panel-col .qr-box-wrap { margin: 0 auto; }
 
 .send-info {
-  flex: 1;
-  min-width: 240px;
+  width: 100%;
   display: flex;
   flex-direction: column;
   gap: 12px;

@@ -117,7 +117,7 @@ function initSender() {
       <!-- 发送面板：生成后置顶显示（二维码 + 状态进度），文件预览在下方 -->
       <div id="sendPanel" hidden>
         <h2 class="panel-title">用接收方手机扫码</h2>
-        <div class="qr-row">
+        <div class="send-panel-col">
           <div class="qr-box-wrap">
             <div class="qr-box loading" id="qrBox">二维码生成中…</div>
             <button class="qr-refresh" id="btnReqr" title="刷新二维码">
@@ -128,12 +128,12 @@ function initSender() {
           </div>
           <div class="send-info">
             <div class="status-line"><span class="dot" id="stDot"></span><span id="stText">等待接收方扫码…</span><span class="mode-badge" id="modeBadge" hidden></span></div>
-            <div class="progress" id="prog" hidden><div class="fill" id="progFill"></div></div>
-            <div class="progress-meta" id="progMeta" hidden><span id="progBytes"></span><span id="progSpeed"></span></div>
             <div class="join-url">
               <input id="joinUrl" spellcheck="false" title="接收方访问的地址，可改成局域网 IP 或公网域名">
               <button class="btn ghost" id="btnCopy">复制链接</button>
             </div>
+            <div class="progress" id="prog" hidden><div class="fill" id="progFill"></div></div>
+            <div class="progress-meta" id="progMeta" hidden><span id="progBytes"></span><span id="progSpeed"></span></div>
             <div class="banner err" id="errBanner" hidden></div>
           </div>
         </div>
