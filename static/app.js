@@ -512,7 +512,7 @@ function openSenderWs() {
     sendWsCtl({ t: 'meta', files: S.files.map((f) => fileMeta(f)) });
     if (S.transfer.started && S.transfer.mode === 'p2p' && !S.transfer.finished) {
       // P2P 传输中控制通道重连成功，数据通道不受影响
-      setSenderStatus('p2p', 'P2P 传输中（控制通道已恢复）…');
+      setSenderStatus('p2p', 'P2P 传输中…');
     } else if (!S.transfer.started) {
       setSenderStatus('', '等待接收方扫码…');
     }
@@ -530,7 +530,7 @@ function openSenderWs() {
     // P2P 传输中：数据走 DataChannel 不受影响，静默重连控制通道
     if ((S.wsAttempts || 0) < 12 && !S.transfer.finished) {
       S.wsAttempts = (S.wsAttempts || 0) + 1;
-      setSenderStatus('p2p', 'P2P 传输中（控制通道重连中）…');
+      setSenderStatus('p2p', 'P2P 传输中…');
       setTimeout(() => {
         if (!S.closing && !S.transfer.finished && (!S.ws || S.ws.readyState > 1)) openSenderWs();
       }, 2000);
@@ -987,7 +987,7 @@ function openReceiverWs() {
   ws.onopen = () => {
     R.wsAttempts = 0;
     if (R.decided && R.mode === 'p2p') {
-      setReceiverStatus('p2p', 'P2P 接收中（控制通道已恢复）…');
+      setReceiverStatus('p2p', 'P2P 接收中…');
     } else {
       setReceiverStatus('', '已连接，等待发送方…');
     }
@@ -1007,7 +1007,7 @@ function openReceiverWs() {
     if (R.decided && R.mode === 'p2p') {
       if ((R.wsAttempts || 0) < 12) {
         R.wsAttempts = (R.wsAttempts || 0) + 1;
-        setReceiverStatus('p2p', 'P2P 接收中（控制通道重连中）…');
+        setReceiverStatus('p2p', 'P2P 接收中…');
         setTimeout(() => { if (!R.ws || R.ws.readyState > 1) openReceiverWs(); }, 2000);
       }
       return;
