@@ -293,23 +293,36 @@ async function copyJoinUrl() {
   const url = $('#joinUrl').value.trim();
   const btn = $('#btnCopy');
   let ok = false;
-  if (navigator.clipboard) {
-    try { await navigator.clipboard.writeText(url); ok = true; } catch { /* 无权限时降级 */ }
+  // 仅在安全上下文使用现代剪贴板 API；HTTP 部署（如局域网 IP）下它多为
+  // undefined 或被策略拒绝，先 await 失败再降级还会丢失用户手势
+  if (window.isSecureContext && navigator.clipboard) {
+    try { await navigator.clipboard.writeText(url); ok = true; } catch { /* 降级 */ }
   }
   if (!ok) {
-    // 非 HTTPS（如局域网 IP）或剪贴板 API 被拒时的降级方案
     try {
       const ta = document.createElement('textarea');
       ta.value = url;
-      ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+      ta.setAttribute('readonly', '');  // 防安卓聚焦弹软键盘抢走选区
+      ta.style.cssText = 'position:fixed;top:0;left:0;font-size:16px;opacity:0;pointer-events:none';
       document.body.appendChild(ta);
       ta.focus();
       ta.select();
+      ta.setSelectionRange(0, url.length); // 部分安卓内核 select() 不产生选区
       ok = document.execCommand('copy');
       ta.remove();
     } catch { ok = false; }
   }
-  btn.textContent = ok ? '已复制 ✓' : '复制失败';
+  if (!ok) {
+    // 终极兜底：全选地址输入框，让用户长按手动复制
+    const input = $('#joinUrl');
+    input.focus();
+    input.select();
+    try { input.setSelectionRange(0, url.length); } catch { /* noop */ }
+    btn.textContent = '长按地址复制';
+    setTimeout(() => { btn.textContent = '复制链接'; }, 3000);
+    return;
+  }
+  btn.textContent = '已复制 ✓';
   setTimeout(() => { btn.textContent = '复制链接'; }, 1600);
 }
 
