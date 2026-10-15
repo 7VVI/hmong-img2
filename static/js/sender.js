@@ -292,36 +292,44 @@ async function refreshQr() {
 async function copyJoinUrl() {
   const url = $('#joinUrl').value.trim();
   const btn = $('#btnCopy');
-  let ok = false;
-  // 仅在安全上下文使用现代剪贴板 API；HTTP 部署（如局域网 IP）下它多为
-  // undefined 或被策略拒绝，先 await 失败再降级还会丢失用户手势
-  if (window.isSecureContext && navigator.clipboard) {
-    try { await navigator.clipboard.writeText(url); ok = true; } catch { /* 降级 */ }
+  const input = $('#joinUrl');
+
+  // 1) 安全上下文（HTTPS）下的现代剪贴板 API
+  if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
+    try { await navigator.clipboard.writeText(url); return copied(btn); } catch { /* 降级 */ }
   }
-  if (!ok) {
-    try {
-      const ta = document.createElement('textarea');
-      ta.value = url;
-      ta.setAttribute('readonly', '');  // 防安卓聚焦弹软键盘抢走选区
-      ta.style.cssText = 'position:fixed;top:0;left:0;font-size:16px;opacity:0;pointer-events:none';
-      document.body.appendChild(ta);
-      ta.focus();
-      ta.select();
-      ta.setSelectionRange(0, url.length); // 部分安卓内核 select() 不产生选区
-      ok = document.execCommand('copy');
-      ta.remove();
-    } catch { ok = false; }
-  }
-  if (!ok) {
-    // 终极兜底：全选地址输入框，让用户长按手动复制
-    const input = $('#joinUrl');
+
+  // 2) 对页面上真实可见的地址输入框做选区复制：
+  //    安卓内核对"真实输入框的选区"放行率远高于动态隐藏 textarea
+  try {
     input.focus();
     input.select();
     try { input.setSelectionRange(0, url.length); } catch { /* noop */ }
-    btn.textContent = '长按地址复制';
-    setTimeout(() => { btn.textContent = '复制链接'; }, 3000);
-    return;
+    if (document.execCommand('copy')) {
+      input.blur(); // 释放焦点，避免软键盘残留
+      return copied(btn);
+    }
+  } catch { /* 降级 */ }
+
+  // 3) Web Share：调起系统分享面板，可直接发给微信/短信等（安卓支持率高）
+  if (navigator.share) {
+    try {
+      await navigator.share({ title: '快传链接', url });
+      btn.textContent = '已调起分享';
+      setTimeout(() => { btn.textContent = '复制链接'; }, 2500);
+      return;
+    } catch { /* 用户取消或不可用，走兜底 */ }
   }
+
+  // 4) 兜底：全选地址输入框，提示长按手动复制
+  input.focus();
+  input.select();
+  try { input.setSelectionRange(0, url.length); } catch { /* noop */ }
+  btn.textContent = '长按地址复制';
+  setTimeout(() => { btn.textContent = '复制链接'; }, 3000);
+}
+
+function copied(btn) {
   btn.textContent = '已复制 ✓';
   setTimeout(() => { btn.textContent = '复制链接'; }, 1600);
 }
