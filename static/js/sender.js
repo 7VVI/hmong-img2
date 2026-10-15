@@ -105,6 +105,7 @@ export function initSender() {
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') closePreview();
   });
+  watchVisibility();
 }
 
 /* ---------- 文件选择与缩略图 ---------- */
@@ -294,32 +295,32 @@ async function copyJoinUrl() {
   const btn = $('#btnCopy');
   const input = $('#joinUrl');
 
-  // 1) 安全上下文（HTTPS）下的现代剪贴板 API
+  // 1) 安全上下文（HTTPS）下的现代剪贴板 API（可信）
   if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
     try { await navigator.clipboard.writeText(url); return copied(btn); } catch { /* 降级 */ }
   }
 
-  // 2) 对页面上真实可见的地址输入框做选区复制：
-  //    安卓内核对"真实输入框的选区"放行率远高于动态隐藏 textarea
-  try {
-    input.focus();
-    input.select();
-    try { input.setSelectionRange(0, url.length); } catch { /* noop */ }
-    if (document.execCommand('copy')) {
-      input.blur(); // 释放焦点，避免软键盘残留
-      return copied(btn);
-    }
-  } catch { /* 降级 */ }
-
-  // 3) Web Share：调起系统分享面板，可直接发给微信/短信等（安卓支持率高）
+  // 2) Web Share：调起系统分享面板。HTTP 下 execCommand 会"假成功"（返回 true
+  //    但剪贴板没有内容），分享面板用户可见、结果可信，且面板内一般带复制选项
   if (navigator.share) {
     try {
       await navigator.share({ title: '快传链接', url });
       btn.textContent = '已调起分享';
       setTimeout(() => { btn.textContent = '复制链接'; }, 2500);
       return;
-    } catch { /* 用户取消或不可用，走兜底 */ }
+    } catch { /* 用户取消或不可用，继续降级 */ }
   }
+
+  // 3) 真实输入框选区复制（桌面浏览器可信；部分安卓内核不可信）
+  try {
+    input.focus();
+    input.select();
+    try { input.setSelectionRange(0, url.length); } catch { /* noop */ }
+    if (document.execCommand('copy')) {
+      input.blur();
+      return copied(btn);
+    }
+  } catch { /* 降级 */ }
 
   // 4) 兜底：全选地址输入框，提示长按手动复制
   input.focus();
@@ -357,21 +358,30 @@ function openSenderWs() {
     if (typeof ev.data === 'string') senderOnCtl(JSON.parse(ev.data));
   };
   ws.onclose = () => {
-    if (S.closing) return;
-    const p2pActive = S.transfer.started && S.transfer.mode === 'p2p' && !S.transfer.finished;
-    if (!p2pActive) {
-      if (!S.transfer.finished) setSenderStatus('err', '与服务器的连接已断开，请刷新页面重试');
-      return;
-    }
-    // P2P 传输中：数据走 DataChannel 不受影响，静默重连控制通道
-    if ((S.wsAttempts || 0) < 12 && !S.transfer.finished) {
+    if (S.closing || S.transfer.finished) return;
+    const p2pActive = S.transfer.started && S.transfer.mode === 'p2p';
+    // 断开自动重连：移动端切后台浏览器会冻结页面并掐断 WebSocket，
+    // 回前台/网络抖动后重连即可恢复（服务器对房间有宽限期）
+    if ((S.wsAttempts || 0) < 60) {
       S.wsAttempts = (S.wsAttempts || 0) + 1;
-      setSenderStatus('p2p', 'P2P 传输中…');
+      setSenderStatus(p2pActive ? 'p2p' : '', p2pActive ? 'P2P 传输中…' : '正在重新连接服务器…');
       setTimeout(() => {
         if (!S.closing && !S.transfer.finished && (!S.ws || S.ws.readyState > 1)) openSenderWs();
       }, 2000);
+      return;
     }
+    if (!p2pActive) setSenderStatus('err', '与服务器的连接已断开，请刷新页面重试');
   };
+}
+
+// 回前台时连接多已失效（后台冻结被掐断），立即重连不等定时器
+function watchVisibility() {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || !S || !S.room) return;
+    if (!S.closing && !S.transfer.finished && (!S.ws || S.ws.readyState > 1)) {
+      openSenderWs();
+    }
+  });
 }
 
 function fileMeta(f) {
@@ -736,6 +746,11 @@ function updateSenderProgress(i, filePct) {
 }
 
 /* ---------- 对外状态（测试钩子/调试用） ---------- */
+
+// 模拟移动端切后台：主动掐断控制连接（测试重连与宽限期）
+export function dropWs() {
+  if (S && S.ws) { try { S.ws.close(); } catch { /* noop */ } }
+}
 
 export function getState() {
   return S && ({

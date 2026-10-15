@@ -98,23 +98,27 @@ async fn handle_ctl_socket(socket: WebSocket, params: WsParams, state: Arc<AppSt
             if let Some(old) = reg.replaced_tx {
                 let _ = old.send(Message::Close(None));
             }
-            if !is_sender {
-                if reg.done {
-                    // 任务已被接收过：一次任务只允许接收一次，直接提示结束
-                    let _ = tx.send(
-                        Message::Text(json!({"t":"session-state","done":true}).to_string().into()),
-                    );
-                    tracing::info!("接收方加入已完成房间 {room_id}，已提示传输结束");
-                } else {
-                    if let Some(meta) = reg.meta {
-                        let _ = tx.send(Message::Text(meta.to_string().into()));
-                    }
-                    if let Some(sender) = state.rooms.peer_ctl_tx(&room_id, false) {
-                        let _ = sender
-                            .send(Message::Text(json!({"t":"peer-joined"}).to_string().into()));
-                    }
-                    tracing::info!("接收方加入房间 {room_id}");
+            if is_sender {
+                // 发送方（重）上线且接收方已在等待：补发加入通知，让发送方发起协商
+                // （发送方断线重连场景，接收方的首次加入通知已丢失）
+                if reg.receiver_tx.is_some() {
+                    let _ = tx.send(Message::Text(json!({"t":"peer-joined"}).to_string().into()));
                 }
+            } else if reg.done {
+                // 任务已被接收过：一次任务只允许接收一次，直接提示结束
+                let _ = tx.send(
+                    Message::Text(json!({"t":"session-state","done":true}).to_string().into()),
+                );
+                tracing::info!("接收方加入已完成房间 {room_id}，已提示传输结束");
+            } else {
+                if let Some(meta) = reg.meta {
+                    let _ = tx.send(Message::Text(meta.to_string().into()));
+                }
+                if let Some(sender) = state.rooms.peer_ctl_tx(&room_id, false) {
+                    let _ =
+                        sender.send(Message::Text(json!({"t":"peer-joined"}).to_string().into()));
+                }
+                tracing::info!("接收方加入房间 {room_id}");
             }
         }
     }
@@ -154,19 +158,26 @@ async fn handle_ctl_socket(socket: WebSocket, params: WsParams, state: Arc<AppSt
     }
 
     match state.rooms.unregister_ctl(&room_id, is_sender, &tx) {
-        Unregister::SenderRemoved {
-            receiver_ctl,
-            close_list,
-        } => {
-            for data_tx in close_list {
-                let _ = data_tx.send(Message::Close(None)).await;
-            }
-            if let Some(receiver) = receiver_ctl {
-                let _ =
-                    receiver.send(Message::Text(json!({"t":"room-closed"}).to_string().into()));
-                let _ = receiver.send(Message::Close(None));
-            }
-            tracing::info!("发送方离开，房间 {room_id} 关闭");
+        Unregister::SenderRemoved => {
+            // 宽限销毁：发送方可能只是切后台/网络抖动（移动端浏览器会掐断
+            // WebSocket），15 秒内重连则房间保活并恢复会话；期满未归才销毁
+            tracing::info!("发送方离开房间 {room_id}，进入 15 秒宽限期");
+            let state = state.clone();
+            let room_id = room_id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                if let Some((receiver_ctl, close_list)) = state.rooms.grace_evict(&room_id) {
+                    for data_tx in close_list {
+                        let _ = data_tx.send(Message::Close(None)).await;
+                    }
+                    if let Some(receiver) = receiver_ctl {
+                        let _ =
+                            receiver.send(Message::Text(json!({"t":"room-closed"}).to_string().into()));
+                        let _ = receiver.send(Message::Close(None));
+                    }
+                    tracing::info!("发送方未在宽限期内返回，房间 {room_id} 销毁");
+                }
+            });
         }
         Unregister::ReceiverRemoved {
             sender_ctl,

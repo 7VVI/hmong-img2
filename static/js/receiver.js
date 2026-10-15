@@ -59,6 +59,7 @@ export function initReceiver() {
       closeReceiverDataWs();
     }
   }, 30000);
+  watchVisibility();
 
   fetch('/api/rooms/' + encodeURIComponent(ROOM))
     .then((res) => {
@@ -95,19 +96,28 @@ function openReceiverWs() {
     if (R.sessionEnded) return;
     // 任务已完整接收：停留在完成界面，不重连（重连会顶掉新扫码的接收方）
     if (isTaskDone()) return;
-    // P2P 模式数据走 DataChannel，控制通道断开不致命，自动重连
-    if (R.decided && R.mode === 'p2p') {
-      if ((R.wsAttempts || 0) < 12) {
-        R.wsAttempts = (R.wsAttempts || 0) + 1;
-        setReceiverStatus('p2p', 'P2P 接收中…');
-        setTimeout(() => { if (!R.ws || R.ws.readyState > 1) openReceiverWs(); }, 2000);
-      }
+    // 断开自动重连：移动端切后台被掐断/网络抖动后恢复
+    if ((R.wsAttempts || 0) < 60) {
+      R.wsAttempts = (R.wsAttempts || 0) + 1;
+      const p2p = R.decided && R.mode === 'p2p';
+      setReceiverStatus(p2p ? 'p2p' : '', p2p ? 'P2P 接收中…' : '正在重新连接服务器…');
+      setTimeout(() => { if (!R.ws || R.ws.readyState > 1) openReceiverWs(); }, 2000);
       return;
     }
     if (!R.completeSeen || !R.metas || R.received < R.metas.length) {
       setReceiverStatus('err', '与服务器的连接已断开，请刷新重试');
     }
   };
+}
+
+// 回前台时连接多已失效（后台冻结被掐断），立即重连不等定时器
+function watchVisibility() {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || !R) return;
+    if (!R.sessionEnded && !isTaskDone() && (!R.ws || R.ws.readyState > 1)) {
+      openReceiverWs();
+    }
+  });
 }
 
 // 数据槽位提前连接好，中转决策后立即可用
@@ -171,6 +181,8 @@ function receiverOnCtl(msg) {
       maybeAllDone();
       break;
     case 'session-state': {
+      // 本会话已在接收（断线重连触发的重复通知）：忽略，不能把正在传输的接收方误杀
+      if (R.metas) break;
       // 发送方会话已开始：本接收方无法加入本次传输
       R.sessionEnded = true;
       $('#rWait').hidden = true;
@@ -182,10 +194,12 @@ function receiverOnCtl(msg) {
     case 'cancel':
       // 任务已完整接收后，发送方后续动作（关页/再传一批）不影响完成状态
       if (isTaskDone() || R.sessionEnded) break;
+      R.sessionEnded = true; // 会话已终止：随后的连接关闭不再触发重连
       setReceiverStatus('err', '发送方已取消传输');
       break;
     case 'room-closed':
       if (isTaskDone() || R.sessionEnded) { closeReceiverDataWs(); break; }
+      R.sessionEnded = true;
       setReceiverStatus('err', '发送方已结束传输');
       closeReceiverDataWs();
       break;

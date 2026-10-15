@@ -59,15 +59,13 @@ pub struct CtlRegister {
     pub meta: Option<Value>,
     /// 任务已完成（接收方扫码应直接收到结束提示）。
     pub done: bool,
+    /// 发送方登记时已在线的接收方（发送方断线重连场景，需向发送方补发加入通知）。
+    pub receiver_tx: Option<ClientTx>,
 }
 
 pub enum UnregisterOutcome {
-    /// 发送方控制连接注销：房间随之移除。
-    /// `receiver_ctl` 需要收到关闭通知；`close_list` 为所有数据槽位（需发送 Close）。
-    SenderRemoved {
-        receiver_ctl: Option<ClientTx>,
-        close_list: Vec<DataTx>,
-    },
+    /// 发送方控制连接注销：房间进入宽限期（调用方调度延迟销毁）。
+    SenderRemoved,
     /// 接收方控制连接注销：`sender_ctl` 需要收到通知；`close_list` 为接收方数据槽位。
     ReceiverRemoved {
         sender_ctl: Option<ClientTx>,
@@ -130,20 +128,22 @@ impl RoomRegistry {
             &mut room.receiver_ctl
         };
         let replaced_tx = slot.replace(tx);
-        let (meta, done) = if is_sender {
-            (None, false)
+        let (meta, done, receiver_tx) = if is_sender {
+            // 发送方（重）上线：若接收方已在线，带回其通道供补发加入通知
+            (None, false, room.receiver_ctl.clone())
         } else {
             // 任务已结束后不再下发文件清单，扫码方直接收到结束提示
             if room.done {
-                (None, true)
+                (None, true, None)
             } else {
-                (room.meta.clone(), false)
+                (room.meta.clone(), false, None)
             }
         };
         Some(CtlRegister {
             replaced_tx,
             meta,
             done,
+            receiver_tx,
         })
     }
 
@@ -210,6 +210,8 @@ impl RoomRegistry {
     }
 
     /// 注销控制连接；仅当 `tx` 仍持有槽位时生效，避免误伤顶替上来的新连接。
+    /// 发送方注销不立即销毁房间（切后台/网络抖动场景）：只清空发送方槽位，
+    /// 由调用方调度宽限期，期满仍未重连才经 [`Self::grace_evict`] 销毁。
     pub fn unregister_ctl(&self, id: &str, is_sender: bool, tx: &ClientTx) -> UnregisterOutcome {
         let mut rooms = self.0.lock().unwrap();
         let Some(room) = rooms.get_mut(id) else {
@@ -218,14 +220,8 @@ impl RoomRegistry {
         let mine =
             |slot: &Option<ClientTx>| slot.as_ref().map(|t| t.same_channel(tx)).unwrap_or(false);
         if is_sender && mine(&room.sender_ctl) {
-            let mut close_list: Vec<DataTx> = room.sender_data.values().cloned().collect();
-            close_list.extend(room.receiver_data.values().cloned());
-            let receiver_ctl = room.receiver_ctl.clone();
-            rooms.remove(id);
-            UnregisterOutcome::SenderRemoved {
-                receiver_ctl,
-                close_list,
-            }
+            room.sender_ctl = None;
+            UnregisterOutcome::SenderRemoved
         } else if !is_sender && mine(&room.receiver_ctl) {
             room.receiver_ctl = None;
             let close_list: Vec<DataTx> = room.receiver_data.values().cloned().collect();
@@ -237,6 +233,21 @@ impl RoomRegistry {
         } else {
             UnregisterOutcome::NotOwner
         }
+    }
+
+    /// 宽限期满销毁：仅当发送方仍未重连时移除房间，
+    /// 返回需要通知关闭的接收方控制通道与数据槽位。
+    pub fn grace_evict(&self, id: &str) -> Option<(Option<ClientTx>, Vec<DataTx>)> {
+        let mut rooms = self.0.lock().unwrap();
+        let room = rooms.get_mut(id)?;
+        if room.sender_ctl.is_some() {
+            return None; // 发送方已在宽限期内重连，房间保活
+        }
+        let receiver_ctl = room.receiver_ctl.take();
+        let close_list: Vec<DataTx> = room.receiver_data.values().cloned().collect();
+        room.receiver_data.clear();
+        rooms.remove(id);
+        Some((receiver_ctl, close_list))
     }
 
     /// 注销数据槽位（连接断开时自清理）。

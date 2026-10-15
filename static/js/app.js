@@ -4,7 +4,7 @@
 import { renderShell } from './shell.js';
 import { ROOM } from './config.js';
 import { ensureSenderAccess } from './auth-gate.js';
-import { initSender, addSenderFiles, beginSend, getState as senderState } from './sender.js';
+import { initSender, addSenderFiles, beginSend, dropWs, getState as senderState } from './sender.js';
 import { initReceiver, getState as receiverState } from './receiver.js';
 
 renderShell();
@@ -18,6 +18,7 @@ window.__test = {
   sender: {
     addFiles: (files) => addSenderFiles(files),
     start: () => beginSend(),
+    dropWs: () => dropWs(),
     state: () => senderState(),
   },
   receiver: {
